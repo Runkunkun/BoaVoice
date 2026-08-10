@@ -71,6 +71,8 @@ async-compat = "0.2.5"
 url = "2.5.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSAppearance",
@@ -83,7 +85,50 @@ objc2-app-kit = { version = "0.3", features = [
     "NSVisualEffectView",
     "NSWindow",
 ] }
-objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFArray",
+    "CFBase",
+    "CFCGTypes",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMSync",
+    "CMTime",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSValue",
+] }
+# Capturing a screen — or a single window, which is the part ffmpeg cannot do — and the machine's own
+# sound, both under the screen-recording permission the app already asks for. Feature-gated per class,
+# so only what is used is compiled.
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCError",
+    "SCShareableContent",
+    "SCStream",
+] }
+# The hardware H.264 encoder. Replacing ffmpeg with this is what removes a 76 MB GPL binary from the
+# app rather than shipping one.
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTCompressionSession",
+    "VTErrors",
+    "VTSession",
+] }
 
 [dev-dependencies]
 tempfile = "3"

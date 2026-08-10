@@ -35,6 +35,8 @@
 
 pub mod audio;
 pub mod ffmpeg;
+#[cfg(target_os = "macos")]
+pub mod mac;
 pub mod recv;
 pub mod send;
 
