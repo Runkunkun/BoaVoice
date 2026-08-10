@@ -30,6 +30,12 @@ services:
 
     volumes:
       # The SQLite database and the attachment blobs. Everything else in the container is disposable.
+      #
+      # A host path rather than a named volume, because this is the thing worth backing up and a path
+      # you can see beats one under /var/lib/docker. The container's entrypoint gives the directory to
+      # the unprivileged user it runs as, so it does not matter who created it — which is exactly what
+      # went wrong before that existed: a bind mount replaces the directory the image prepared, and
+      # SQLite could not create its file.
       - ./data:/data
 
     environment:

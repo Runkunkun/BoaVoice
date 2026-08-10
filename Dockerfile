@@ -61,18 +61,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Not root. The server needs no privileges at all: it binds ports above 1024 and writes to one
-# directory.
+# The server itself needs no privileges: it binds ports above 1024 and writes to one directory. It
+# does not *start* unprivileged, though — see docker/entrypoint.sh, which fixes the ownership of a
+# bind-mounted data directory (something a Dockerfile cannot do, because a bind mount replaces the
+# directory the image prepared) and then drops to this user before running anything.
 RUN useradd --system --create-home --uid 10001 boa
 COPY --from=build /src/target/release/boa-server /usr/local/bin/boa-server
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Everything that survives a restart lives here: the SQLite file and the attachment blobs. Mount it,
 # or a container replacement loses the conversations.
-ENV BOA_DATA_DIR=/data
+ENV BOA_DATA_DIR=/data \
+    BOA_UID=10001 \
+    BOA_GID=10001
 RUN mkdir -p /data && chown boa:boa /data
 VOLUME ["/data"]
 
-USER boa
 WORKDIR /data
 
 # TCP for chat and control, UDP for voice and screens. **Both** have to be published, and the UDP one
@@ -84,4 +89,4 @@ EXPOSE 8788/udp
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8787/api/info || exit 1
 
-ENTRYPOINT ["boa-server"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
