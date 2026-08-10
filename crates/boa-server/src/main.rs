@@ -58,7 +58,10 @@ async fn main() -> Result<()> {
         boa_proto::ATTACHMENT_TTL_SECS / 86_400,
     );
     if db.is_empty()? {
-        log::info!("no accounts yet — the first one to register becomes the owner");
+        log::info!(
+            "no accounts yet — the first to register gets the starter channels, \
+             and may register even with --closed-registration"
+        );
     }
 
     let media_bind = SocketAddr::new(config.bind.ip(), config.media_port);
