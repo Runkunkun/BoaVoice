@@ -183,8 +183,17 @@ impl Db {
 
     /// Whether anybody has an account yet.
     ///
-    /// The first account to register on a fresh server is the admin, which is how a
-    /// self-hosted box avoids needing an out-of-band setup step.
+    /// Used for two things, and *not* for a third. The first account may always register, even with
+    /// registration otherwise closed — which is how a self-hosted box avoids needing an out-of-band
+    /// setup step — and it is the one that gets the starter channels created alongside it.
+    ///
+    /// What it does not do is confer any authority. **There is no admin in this server.** Every
+    /// account can do the same things: post, edit and delete *its own* messages, create channels,
+    /// join voice, share a screen. Nothing in the protocol deletes somebody else's message, removes a
+    /// channel or touches another account, so there is nothing for an administrator to be trusted
+    /// with yet. The only lever an operator has is `--closed-registration`, and that is deliberate:
+    /// a role system whose only power is "can create channels" is ceremony, and one that could delete
+    /// other people's messages is a feature nobody asked for.
     pub fn is_empty(&self) -> Result<bool> {
         let conn = self.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;

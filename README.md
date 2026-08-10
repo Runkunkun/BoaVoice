@@ -40,8 +40,14 @@ cargo build --release
 ./target/release/boa-server --name "Home" --data-dir /srv/boavoice
 ```
 
-That is the whole setup. The first account to register becomes the owner, and gets a `#general`
-and a `Lounge` to start with.
+That is the whole setup. The first account to register gets a `#general` and a `Lounge` created
+alongside it, and may always register even when registration is otherwise closed.
+
+**It is not an administrator, because there is no such thing here.** Every account can do the same
+things: post, edit and delete its own messages, create channels, join voice, share a screen. No
+message in the protocol deletes somebody else's post, removes a channel or touches another account —
+so the only lever an operator has is whether new accounts may be created at all. That is
+`--closed-registration`, and for a box on the open internet it is the one to reach for.
 
 **Open two ports.** TCP 8787 for chat and control, **UDP 8788 for voice and screens**. The UDP
 one cannot go through an HTTP reverse proxy, and forgetting it is the single most common
@@ -112,7 +118,9 @@ Two things to get right, and they are the only two that catch people out:
   while nobody can hear anybody.
 * **Close registration once your accounts exist.** Uncomment `BOA_CLOSED_REGISTRATION` and redeploy.
   The first account is always allowed to register, so you can set it from the very beginning: you
-  register, and then nobody else can.
+  register, and then nobody else can. This matters more than it looks, because there is no
+  administrator to clean up after a stranger — every account is equal, and the way to keep a public
+  box yours is to control who gets one.
 
 If the pulling variant reports `manifest unknown` or asks for credentials, the package is still
 private — a package published by Actions starts private even for a public repository. Set it to
