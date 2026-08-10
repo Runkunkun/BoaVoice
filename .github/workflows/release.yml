@@ -30,6 +30,10 @@ env:
   CARGO_TERM_COLOR: always
   # Static libopus, so a downloaded app depends on nothing the user has to install.
   OPUS_STATIC: "1"
+  # The vendored libopus asks for `cmake_minimum_required(VERSION 3.1)`, and CMake 4 — which is what
+  # the runners have — refuses anything below 3.5 outright. This is CMake's own escape hatch for
+  # exactly that situation, and it is the difference between a release with downloads and one without.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   macos:
@@ -53,9 +57,17 @@ jobs:
           key: release-${{ matrix.target }}
 
       # `audiopus_sys` compiles libopus with cmake when pkg-config finds none, which on a runner is
-      # always. The arm64 macOS images do not all ship cmake.
+      # always — and it has to be the source build here rather than a Homebrew libopus, because this job
+      # builds for *both* Mac architectures and a Homebrew library is only ever one of them.
+      #
+      # Pinned to 3.31, and that is the whole point of the step: the vendored opus asks for
+      # `cmake_minimum_required(VERSION 3.1)`, and CMake 4 removed support for anything below 3.5. The
+      # runners ship CMake 4, so an unpinned cmake fails before it compiles a line.
       - name: cmake
-        run: cmake --version || brew install cmake
+        run: |
+          python3 -m pip install --break-system-packages --upgrade "cmake==3.31.6" || \
+            python3 -m pip install --upgrade "cmake==3.31.6"
+          cmake --version
 
       - name: build
         run: cargo build --release --target ${{ matrix.target }} --bin boavoice
@@ -127,8 +139,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows
+      # Pinned for the same reason as the macOS job: CMake 4 refuses the vendored opus outright.
       - name: cmake
-        run: cmake --version
+        run: |
+          python -m pip install --upgrade "cmake==3.31.6"
+          cmake --version
       - name: build
         run: cargo build --release --bin boavoice
       - name: collect

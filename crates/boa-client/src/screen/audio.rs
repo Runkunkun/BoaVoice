@@ -171,7 +171,7 @@ pub fn parse_audio_devices(listing: &str) -> Vec<(u32, String)> {
 fn pulse_monitor() -> Loopback {
     // `pactl` names the monitor exactly; `@DEFAULT_MONITOR@` is the fallback, which PulseAudio
     // resolves itself and PipeWire's compatibility layer also understands.
-    let named = Command::new("pactl")
+    let named = std::process::Command::new("pactl")
         .args(["get-default-sink"])
         .output()
         .ok()

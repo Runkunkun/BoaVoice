@@ -20,6 +20,10 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   # Link libopus into the binary rather than against a library the host has to provide.
   OPUS_STATIC: "1"
+  # The vendored libopus asks for `cmake_minimum_required(VERSION 3.1)`, and CMake 4 — which is what
+  # the runners have — refuses anything below 3.5 outright. This is CMake's own escape hatch for
+  # exactly that situation, and it is the difference between a release with downloads and one without.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   test:
@@ -66,12 +70,27 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             cmake nasm
 
-      # The arm64 macOS images are leaner than the Intel ones were and do not all ship cmake, which
-      # `audiopus_sys` needs to compile libopus. `|| true` because when it *is* present brew exits
-      # non-zero for "already installed".
-      - name: cmake (macOS)
+      # libopus itself, rather than the cmake to build it from source. Homebrew ships `libopus.a`, so
+      # `pkg-config` finds it, `OPUS_STATIC` links it *into* the binary, and the resulting app has no
+      # dependency on Homebrew at all — which is what a downloadable release needs. The source build is
+      # still there as the fallback, hence cmake, and hence `CMAKE_POLICY_VERSION_MINIMUM` above: the
+      # vendored copy of opus asks for CMake 3.1 and CMake 4 refuses anything below 3.5.
+      - name: libopus (macOS)
         if: matrix.os == 'macos-latest'
-        run: cmake --version || brew install cmake
+        run: |
+          brew install pkg-config opus || brew upgrade pkg-config opus || true
+          pkg-config --modversion opus || echo "no pkg-config opus — falling back to the source build"
+          cmake --version || brew install cmake
+
+      # Windows has no pkg-config to find a libopus with, so `audiopus_sys` compiles it — and CMake 4,
+      # which the runners ship, refuses the vendored copy's `cmake_minimum_required(VERSION 3.1)`. 3.31
+      # accepts it with a deprecation warning, which is the difference between a green build and no
+      # Windows binary at all.
+      - name: cmake (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          python -m pip install --upgrade "cmake==3.31.6"
+          cmake --version
 
       # Output is captured and, on failure, echoed back as workflow annotations. Without this the only
       # public record of a failed build is its exit code: the log itself needs admin rights to read
