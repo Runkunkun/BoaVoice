@@ -1,0 +1,83 @@
+# Publish the server image on every push to main.
+#
+# Separate from release.yml, which only runs on a tag. A self-hosted server wants to be updatable
+# without cutting a release — `docker compose pull && up -d` against `:latest` — and the image is the
+# one artefact here that has no reason to wait for the desktop builds to be green.
+#
+# Two architectures, because a box at home is as likely to be an ARM single-board machine as an x86
+# server. The arm64 half is built under QEMU on an x86 runner: slower, but one job instead of the
+# three (build, build, merge-manifest) that native runners would need, and the layer cache means only
+# a real source change pays for it.
+
+name: image
+
+on:
+  push:
+    branches: [main]
+    # Only when something that ends up *in* the image changes. A README edit should not rebuild it.
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/boa-proto/**"
+      - "crates/boa-server/**"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Required for the arm64 build on an x86 runner. Without it buildx reports
+      # "exec format error" and the arm64 half fails while amd64 succeeds — which produces a
+      # half-pushed manifest rather than a clean failure.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr.io rejects an uppercase path and GitHub usernames may have capitals.
+      - name: image name
+        id: name
+        run: |
+          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/$owner/boavoice-server" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=main
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: where it went
+        run: |
+          echo "### Pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "A package published by Actions starts **private**, even for a public repository." >> "$GITHUB_STEP_SUMMARY"
+          echo "Set it to public under the repository's Packages, or \`docker login ghcr.io\` on the server." >> "$GITHUB_STEP_SUMMARY"

@@ -145,6 +145,9 @@ jobs:
     name: server image
     steps:
       - uses: actions/checkout@v4
+      # The arm64 half is built under emulation on an x86 runner; without QEMU registered, buildx
+      # fails it with "exec format error" while amd64 succeeds.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:

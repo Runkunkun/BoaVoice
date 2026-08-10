@@ -1,0 +1,47 @@
+# A BoaVoice server built from source, on the machine that will run it.
+#
+# Use this one when you would rather not depend on a registry — in Portainer, as a stack from this
+# repository, this is the file to point at. It compiles the server in the container (two or three
+# minutes, and it wants about 2 GB of memory while it does) and then throws the toolchain away: the
+# image that runs is the same slim one the published builds use.
+#
+#     docker compose -f docker-compose.build.yml up -d --build
+#
+# To update, pull the repository and repeat with `--build`. The `data` directory survives.
+#
+# The registry version is `docker-compose.yml`, which pulls a prebuilt image instead and is the faster
+# path once the image exists.
+
+services:
+  boavoice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: boavoice-server:local
+    container_name: boavoice
+    restart: unless-stopped
+
+    ports:
+      # Chat and control. Put a reverse proxy in front of this one if you want TLS.
+      - "8787:8787/tcp"
+      # Voice and screens. **Not optional, and it cannot go through an HTTP proxy.** A server with
+      # only the TCP port published is a server where chat works and nobody can hear anybody.
+      - "8788:8788/udp"
+
+    volumes:
+      # The SQLite database and the attachment blobs. Everything else in the container is disposable.
+      - ./data:/data
+
+    environment:
+      BOA_NAME: "BoaVoice"
+      BOA_MAX_UPLOAD_MB: "64"
+      # Worth turning on as soon as everybody who needs an account has one: with the port open to the
+      # internet, an open registration is an invitation. The *first* account is always allowed, so
+      # this can be set from the start — you register, then nobody else can.
+      # BOA_CLOSED_REGISTRATION: "1"
+      RUST_LOG: "info"
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M

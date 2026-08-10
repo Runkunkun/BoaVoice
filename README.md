@@ -77,13 +77,47 @@ docker run -d --name boavoice \
   ghcr.io/runkunkun/boavoice-server:latest
 ```
 
-Or with the committed `docker-compose.yml`, which has the environment variables written out with
-their explanations:
+Or with one of the two committed compose files, which have the environment variables written out
+with their explanations:
+
+| File | What it does |
+|---|---|
+| `docker-compose.yml` | pulls the published image — the fast path |
+| `docker-compose.build.yml` | compiles the server on the machine that will run it, no registry involved |
 
 ```sh
 docker compose up -d
-docker compose pull && docker compose up -d   # to update
+docker compose pull && docker compose up -d              # to update
+docker compose -f docker-compose.build.yml up -d --build # or build it here
 ```
+
+### With Portainer
+
+**Stacks → Add stack → Repository.**
+
+| Field | Value |
+|---|---|
+| Repository URL | `https://github.com/Runkunkun/BoaVoice` |
+| Reference | `refs/heads/main` |
+| Compose path | `docker-compose.build.yml` (builds here) or `docker-compose.yml` (pulls) |
+
+Then **Deploy the stack**. With the build file, the first deploy takes a few minutes and wants about
+2 GB of memory while it compiles; after that, *Pull and redeploy* updates it.
+
+Two things to get right, and they are the only two that catch people out:
+
+* **The UDP port has to be open in the firewall as well**, and in a cloud provider's security group
+  if there is one. Portainer publishes it because the compose file says so; the host will still drop
+  it otherwise. Voice and screens go over UDP 8788 and nothing else does — chat will work perfectly
+  while nobody can hear anybody.
+* **Close registration once your accounts exist.** Uncomment `BOA_CLOSED_REGISTRATION` and redeploy.
+  The first account is always allowed to register, so you can set it from the very beginning: you
+  register, and then nobody else can.
+
+If the pulling variant reports `manifest unknown` or asks for credentials, the package is still
+private — a package published by Actions starts private even for a public repository. Set it to
+public under the repository's *Packages*, or add `ghcr.io` with a `read:packages` token under
+Portainer's *Registries*.
 
 The image is built for `linux/amd64` and `linux/arm64` on every release, and holds only the
 server — the client is a desktop app with a GPU surface and audio devices, so there is nothing
