@@ -145,6 +145,10 @@ Built apps for all three platforms are on the [releases
 page](https://github.com/Runkunkun/BoaVoice/releases): a zip per macOS architecture, an AppImage,
 and an `.exe`.
 
+**macOS 13 or newer.** Not a preference: the screen capture is ScreenCaptureKit, which the binary
+links against, so an older system cannot launch the app at all — and excluding this app's own audio
+from a share, which is what stops everybody in a call hearing themselves, arrived in 13.
+
 **On macOS the first launch needs one command.** The builds are signed ad-hoc, not notarised —
 that needs a paid Apple developer identity — so macOS quarantines the download and reports that
 the app "is damaged and can't be opened". It is not damaged:

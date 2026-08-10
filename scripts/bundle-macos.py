@@ -13,8 +13,11 @@ For a voice app, three keys in there are doing work that nothing else can do:
   nothing in any log the app can write. This is the single most important line in the file.
 * `NSHighResolutionCapable` — without it macOS runs the window through its 2× upscaler and
   every glyph comes out soft.
-* `LSMinimumSystemVersion` — the vibrancy material the window relies on is a 10.14 API, and
-  below that the app would run with a plain dark background.
+* `LSMinimumSystemVersion` — **13.0, and it is a hard floor rather than a preference.** The screen
+  capture is ScreenCaptureKit, which the binary links against, so on an older system the app does
+  not start at all: dyld cannot find the framework and there is nothing the app can do about it from
+  the inside. 13.0 rather than 12.3 (when the framework arrived) because excluding this app's own
+  audio from a share — the thing that stops everybody hearing themselves — needs 13.
 
 Screen recording needs no key. There is no plist entry that pre-authorises it: the app asks
 for it directly (`CGRequestScreenCaptureAccess`), macOS shows its prompt, and the answer is
@@ -67,8 +70,10 @@ def info_plist(app_version):
         "CFBundleInfoDictionaryVersion": "6.0",
         # Retina. Without this the window is upscaled and the type goes soft.
         "NSHighResolutionCapable": True,
-        # NSVisualEffectView's window-background material needs 10.14.
-        "LSMinimumSystemVersion": "10.14",
+        # ScreenCaptureKit is linked, not loaded on demand, so an older system cannot launch this at
+        # all. 13.0 is where `excludesCurrentProcessAudio` arrived, which the desktop-audio share
+        # depends on. (NSVisualEffectView's material, the other version-sensitive piece, needs 10.14.)
+        "LSMinimumSystemVersion": "13.0",
         "LSUIElement": False,
         "NSHumanReadableCopyright": "MIT OR Apache-2.0",
         # The one that must not be missing. An app that opens an input device without it is
