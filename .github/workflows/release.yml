@@ -214,7 +214,12 @@ jobs:
           cache-to: type=gha,mode=max
 
   publish:
-    needs: [macos, linux, windows, docker]
+    # **Not `docker`.** The image publishes itself to the registry in its own job, and the downloads
+    # have no reason to wait for it — it is a multi-architecture build with the arm64 half under
+    # emulation, so it is by far the slowest thing here and the most likely to fail on something
+    # incidental. It did exactly that on v0.1.1: the image was pushed and complete, a later step in the
+    # job failed anyway, and the release was skipped — four built apps that nobody could download.
+    needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     name: publish the release
     steps:
@@ -222,6 +227,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      # Printed because the alternative is a release with no files and no clue why: the table in the
+      # notes below is built from these paths, and so is what gets attached.
+      - name: what was built
+        run: find artifacts -type f | sort
 
       - name: notes
         run: |
