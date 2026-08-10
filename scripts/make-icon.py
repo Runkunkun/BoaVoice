@@ -6,13 +6,14 @@ struct the format actually requires, so the icon rebuilds from a plain checkout 
 nothing but a Python interpreter. It is a close relative of RedPython's script, which is
 where the approach comes from.
 
-The source is white line art on nothing — `boa-source.svg` rasterises to RGBA with a
-transparent background, so the alpha channel already *is* the coverage mask, exactly as the
-drawing program laid it down. Antialiased edges and round stroke caps all survive without a
-threshold anywhere.
+The source is the drawing on nothing — `boa-source.svg` rasterises to RGBA with a transparent
+background, so the alpha channel already *is* the coverage mask, exactly as the drawing program laid
+it down. Antialiased edges survive without a threshold anywhere, and the *colour* in the SVG is
+irrelevant: only its alpha is read, and the ink colour is chosen here.
 
-What is left to do is composite: area-average the mask down to each size macOS asks for,
-paint the glyph white onto a green superellipse tile, and hand the set to `iconutil`.
+What is left to do is composite: area-average both masks down to each size macOS asks for, paint the
+head onto a green superellipse tile in near-black, put the cross and the eyes on it in white, and hand
+the set to `iconutil`.
 
 The one number that differs from the red sibling is the fill fraction. That artwork is a
 wide, flat head; this one is a boa's head seen from above, half as wide as it is tall. The
@@ -33,9 +34,12 @@ import zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGING = os.path.join(ROOT, "packaging")
 
-# Rasterised from boa-source.svg by scripts/raster-svg.sh and committed, which
-# keeps this script free of any SVG dependency.
-SOURCE = os.path.join(PACKAGING, "boa-source.png")
+# Rasterised from boa-source.svg by scripts/raster-svg.sh and committed, which keeps this script free
+# of any SVG dependency. Two masks, because the drawing has two layers — the head, and the inner cross
+# and eyes that sit on top of it. One mask can only say "the drawing is here", which composites to a
+# featureless silhouette.
+SOURCE_INK = os.path.join(PACKAGING, "boa-ink.png")
+SOURCE_HIGHLIGHT = os.path.join(PACKAGING, "boa-highlight.png")
 
 # macOS wants these (size, scale) pairs in an .iconset.
 VARIANTS = [
@@ -50,7 +54,12 @@ VARIANTS = [
 # app stays the palette's.
 TILE_TOP = (52, 214, 92)
 TILE_BOTTOM = (8, 138, 56)
-INK = (255, 255, 255)
+
+# The drawing: a near-black head with the cross and the eyes in white over it, straight onto the
+# green. Near-black rather than pure black because a true 0,0,0 against a saturated green is the one
+# combination that looks like a printing error; a hair of blue in it reads as ink.
+INK = (14, 16, 22)
+HIGHLIGHT = (255, 255, 255)
 
 EXP = 4.6      # superellipse exponent ≈ the macOS "squircle"
 EXTENT = 0.92  # tile size within the canvas, leaving the usual icon padding
@@ -65,26 +74,47 @@ def glyph_fill(size):
     because a glyph twice as tall as it is wide is fitted by its *height* — the same fraction
     would leave the tile visibly empty at the sides.
     """
+    if size <= 16:
+        return 0.92
     if size <= 32:
         return 0.96
     if size <= 64:
-        return 0.92
-    return 0.86
+        return 0.94
+    return 0.88
 
 
 def stroke_gain(size):
-    """Coverage multiplier keeping thin strokes alive once downscaled.
+    """Coverage multiplier keeping thin features alive once downscaled.
 
-    Area-averaging a 22-unit stroke into a 16 px icon leaves it at maybe a third
-    coverage, which renders as pink haze rather than a line. Scaling coverage up
-    (and clamping) restores the line's weight without touching its position.
+    Area-averaging a thin feature into a 16 px icon leaves it at maybe a third coverage, which renders
+    as haze rather than a mark. Scaling coverage up (and clamping) restores its weight without moving
+    it.
+
+    This is the *ink's* multiplier. The highlight gets its own, and much gentler one — see
+    [`highlight_gain`] — because the two pull in opposite directions: gaining the head keeps its
+    silhouette solid, and gaining the white inside it eats the head away.
     """
     if size <= 16:
-        return 2.2
+        return 1.8
     if size <= 32:
-        return 1.5
+        return 1.4
     if size <= 64:
-        return 1.2
+        return 1.15
+    return 1.0
+
+
+def highlight_gain(size):
+    """Coverage multiplier for the cross and the eyes.
+
+    Barely more than one, unlike the ink's. The white sits *inside* the black, so gaining it does not
+    rescue a thin line against a background — it erodes the shape around it, and a 16-pixel icon that
+    has been gained on both layers comes out as a grey smudge with white patches rather than as a
+    head. A little is still wanted, or the cross averages down to a grey that reads as neither.
+    """
+    if size <= 16:
+        return 1.15
+    if size <= 32:
+        return 1.05
     return 1.0
 
 
@@ -243,14 +273,14 @@ def box_downscale(mask, sw, sh, dw, dh):
     return out
 
 
-def tile_coverage(size):
+def tile_coverage(size, extent=EXTENT):
     """Superellipse coverage in 0…1 for a `size`×`size` canvas.
 
     Supersampled because the tile's shoulder is the one edge a viewer looks
     straight at; a hard test would show stair-steps at every icon size.
     """
     cov = [0.0] * (size * size)
-    half = size * EXTENT / 2.0
+    half = size * extent / 2.0
     centre = size / 2.0
     step = 1.0 / SS
     per = 1.0 / (SS * SS)
@@ -267,17 +297,20 @@ def tile_coverage(size):
     return cov
 
 
-def render(size, mask, mw, mh):
-    """Composite one icon: glyph over tile over transparency."""
+def render(size, ink_mask, highlight_mask, mw, mh):
+    """Composite one icon: highlight over ink over tile over transparency."""
     tile = tile_coverage(size)
 
-    # Fit the drawing into the tile's inner box, preserving aspect.
+    # Fit the drawing into the tile's inner box, preserving aspect. Both masks were rasterised from the
+    # same viewBox at the same width, so one scale serves both and they stay registered.
     span = size * EXTENT * glyph_fill(size)
     scale = min(span / mw, span / mh)
     gw, gh = max(1, round(mw * scale)), max(1, round(mh * scale))
-    glyph = box_downscale(mask, mw, mh, gw, gh)
+    ink = box_downscale(ink_mask, mw, mh, gw, gh)
+    highlight = box_downscale(highlight_mask, mw, mh, gw, gh)
 
     gain = stroke_gain(size)
+    light_gain = highlight_gain(size)
     ox, oy = (size - gw) // 2, (size - gh) // 2
 
     px = bytearray(size * size * 4)
@@ -296,11 +329,19 @@ def render(size, mask, mw, mh):
             r, g, b = tr, tg, tb
             gx, gy = x - ox, y - oy
             if 0 <= gx < gw and 0 <= gy < gh:
-                ink = min(1.0, glyph[gy * gw + gx] * gain)
-                if ink > 0.0:
-                    r = round(r + (INK[0] - r) * ink)
-                    g = round(g + (INK[1] - g) * ink)
-                    b = round(b + (INK[2] - b) * ink)
+                at = gy * gw + gx
+                # The head first, then the cross and the eyes over it — the order the drawing has, and
+                # the reason the highlight can be white without a plate behind it.
+                dark = min(1.0, ink[at] * gain)
+                if dark > 0.0:
+                    r = round(r + (INK[0] - r) * dark)
+                    g = round(g + (INK[1] - g) * dark)
+                    b = round(b + (INK[2] - b) * dark)
+                light = min(1.0, highlight[at] * light_gain)
+                if light > 0.0:
+                    r = round(r + (HIGHLIGHT[0] - r) * light)
+                    g = round(g + (HIGHLIGHT[1] - g) * light)
+                    b = round(b + (HIGHLIGHT[2] - b) * light)
 
             o = i * 4
             px[o] = r
@@ -317,17 +358,33 @@ def main():
     ap.add_argument("out", nargs="?", default=os.path.join(PACKAGING, "BoaVoice.icns"))
     args = ap.parse_args()
 
-    if not os.path.exists(SOURCE):
-        raise SystemExit(
-            f"{SOURCE} missing — run scripts/raster-svg.sh first (needs librsvg)"
-        )
+    for source in (SOURCE_INK, SOURCE_HIGHLIGHT):
+        if not os.path.exists(source):
+            raise SystemExit(
+                f"{source} missing — run scripts/raster-svg.sh first (needs librsvg)"
+            )
 
-    mw, mh, rows = read_png(SOURCE)
-    mask = alpha_mask(mw, mh, rows)
-    if not any(a > 0.0 for a in mask):
+    mw, mh, rows = read_png(SOURCE_INK)
+    ink_mask = alpha_mask(mw, mh, rows)
+    hw, hh, hrows = read_png(SOURCE_HIGHLIGHT)
+    highlight_mask = alpha_mask(hw, hh, hrows)
+
+    # The two masks are overlaid pixel for pixel, so a mismatch would silently offset the cross from
+    # the head. It can only happen by rasterising them separately at different widths.
+    if (mw, mh) != (hw, hh):
         raise SystemExit(
-            f"{SOURCE} is fully opaque — it must be rasterised on a transparent "
+            f"the masks are different sizes ({mw}×{mh} and {hw}×{hh}) — "
+            "re-run scripts/raster-svg.sh so both come from one pass"
+        )
+    if not any(a > 0.0 for a in ink_mask):
+        raise SystemExit(
+            f"{SOURCE_INK} is empty or fully opaque — it must be rasterised on a transparent "
             "background, since the alpha channel is the coverage mask"
+        )
+    if not any(a > 0.0 for a in highlight_mask):
+        raise SystemExit(
+            f"{SOURCE_HIGHLIGHT} is empty — the cross and the eyes are the white half of the drawing "
+            "and without them the icon is a silhouette"
         )
 
     iconset = os.path.join(PACKAGING, "BoaVoice.iconset")
@@ -337,7 +394,12 @@ def main():
         px = size * scale
         suffix = "" if scale == 1 else f"@{scale}x"
         name = f"icon_{size}x{size}{suffix}.png"
-        write_png(os.path.join(iconset, name), px, px, render(px, mask, mw, mh))
+        write_png(
+            os.path.join(iconset, name),
+            px,
+            px,
+            render(px, ink_mask, highlight_mask, mw, mh),
+        )
         print(f"  {name} ({px}×{px})")
 
     subprocess.run(["iconutil", "-c", "icns", iconset, "-o", args.out], check=True)
@@ -345,7 +407,7 @@ def main():
 
     # The app also needs a plain PNG for the runtime window icon.
     runtime = os.path.join(PACKAGING, "icon-512.png")
-    write_png(runtime, 512, 512, render(512, mask, mw, mh))
+    write_png(runtime, 512, 512, render(512, ink_mask, highlight_mask, mw, mh))
     print(f"→ {runtime}")
 
 

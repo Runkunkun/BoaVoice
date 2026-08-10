@@ -18,6 +18,8 @@ env:
   CARGO_TERM_COLOR: always
   # Debug info is the bulk of the target directory and nothing here reads a backtrace from CI.
   CARGO_PROFILE_DEV_DEBUG: 0
+  # Link libopus into the binary rather than against a library the host has to provide.
+  OPUS_STATIC: "1"
 
 jobs:
   test:
@@ -34,6 +36,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: test (${{ matrix.name }})
 
+    # bash on all three, so one set of commands works everywhere — Windows runners have it, and the
+    # alternative is maintaining a PowerShell copy of every step.
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - uses: actions/checkout@v4
 
@@ -45,8 +53,9 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
-      # ALSA for cpal, the xcb/xkb set for winit, nasm for OpenH264's assembly paths. Without the
-      # first one the client does not build at all; without the last it builds and is slower.
+      # ALSA for cpal, the xcb/xkb set for winit, cmake to build libopus from source, nasm for
+      # OpenH264's assembly paths. Without ALSA the client does not build at all; without cmake the
+      # opus binding fails in its build script; without nasm it builds and is slower.
       - name: system libraries (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -55,19 +64,62 @@ jobs:
             libasound2-dev \
             libxkbcommon-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            nasm
+            cmake nasm
 
+      # The arm64 macOS images are leaner than the Intel ones were and do not all ship cmake, which
+      # `audiopus_sys` needs to compile libopus. `|| true` because when it *is* present brew exits
+      # non-zero for "already installed".
+      - name: cmake (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cmake --version || brew install cmake
+
+      # Output is captured and, on failure, echoed back as workflow annotations. Without this the only
+      # public record of a failed build is its exit code: the log itself needs admin rights to read
+      # through the API, which is exactly the wrong way round when the point of CI is to tell you what
+      # broke.
       - name: build
-        run: cargo build --workspace --all-targets
+        run: |
+          set -o pipefail
+          cargo build --workspace --all-targets 2>&1 | tee build.log
 
       - name: test
-        run: cargo test --workspace
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee test.log
 
       # No `cargo fmt --check`. The code is laid out by hand at a wider width than rustfmt's
       # default, as its sibling projects are, and a formatting gate would reflow it rather than tidy
       # it. Clippy is the gate that catches things that are actually wrong.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
+
+      - name: what went wrong
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          # One annotation per compiler diagnostic, capped: a broken build can produce hundreds and the
+          # first few are the ones that explain it.
+          shown = 0
+          for name in ("build.log", "test.log", "clippy.log"):
+              for path in glob.glob(name):
+                  with open(path, encoding="utf-8", errors="replace") as handle:
+                      text = handle.read()
+                  for block in re.split(r"\n(?=error|warning: unused|warning: unreach)", text):
+                      if not block.startswith("error") and "-D warnings" not in block:
+                          continue
+                      if shown >= 12:
+                          break
+                      shown += 1
+                      # Annotations are one line, so newlines become a separator GitHub keeps.
+                      flat = block.strip().replace("%", "%25").replace("\r", "")
+                      flat = flat.replace("\n", "%0A")[:3000]
+                      print(f"::error title={path}::{flat}")
+          if shown == 0:
+              print("::error::the step failed without a recognisable compiler diagnostic — see the log")
+          PY
 
   # The image is built on every push so a broken Dockerfile is found here rather than on the server
   # somebody is trying to update. It is not pushed — that is release.yml's job.

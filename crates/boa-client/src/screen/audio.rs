@@ -95,6 +95,11 @@ pub fn find_loopback() -> Result<Loopback, String> {
 /// Matched case-insensitively against a device's name. The order matters only when a machine has
 /// several: BlackHole is the one most people install, and a 2-channel one is what a stereo share
 /// wants.
+///
+/// macOS only, and gated rather than merely unused elsewhere: Linux asks PulseAudio for the monitor
+/// source by name and Windows has one known device, so neither has a list to search — and an
+/// ungated constant is dead code on two of the three platforms.
+#[cfg(target_os = "macos")]
 const LOOPBACK_NAMES: [&str; 6] =
     ["blackhole 2ch", "blackhole", "loopback audio", "soundflower (2ch)", "soundflower", "vb-cable"];
 
@@ -392,6 +397,7 @@ mod tests {
     }
 
     /// The name matching, exercised through the same table the real lookup uses.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_loopback_is_recognised_by_name_and_a_microphone_is_not() {
         let pick = |listing: &str| {

@@ -28,6 +28,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Static libopus, so a downloaded app depends on nothing the user has to install.
+  OPUS_STATIC: "1"
 
 jobs:
   macos:
@@ -49,6 +51,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+
+      # `audiopus_sys` compiles libopus with cmake when pkg-config finds none, which on a runner is
+      # always. The arm64 macOS images do not all ship cmake.
+      - name: cmake
+        run: cmake --version || brew install cmake
 
       - name: build
         run: cargo build --release --target ${{ matrix.target }} --bin boavoice
@@ -92,7 +99,7 @@ jobs:
             libasound2-dev \
             libxkbcommon-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libfuse2 nasm
+            cmake libfuse2 nasm
 
       - name: build
         run: cargo build --release --bin boavoice
@@ -120,6 +127,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows
+      - name: cmake
+        run: cmake --version
       - name: build
         run: cargo build --release --bin boavoice
       - name: collect
