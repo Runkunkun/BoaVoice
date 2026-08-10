@@ -1034,16 +1034,17 @@ impl App {
                     self.notify(Notice::error("join a voice channel first"));
                     return;
                 }
-                if !crate::screen::ffmpeg_available() {
-                    // Said before anything is announced, rather than after a share that sends
-                    // nothing — and it names the places that were searched, because the commonest
-                    // cause is not a missing ffmpeg but an app that cannot see the one installed.
+                // Only where ffmpeg is what does the capturing. Said before anything is announced,
+                // rather than after a share that sends nothing — and it names the places that were
+                // searched, because the commonest cause is not a missing ffmpeg but an app that cannot
+                // see the one installed.
+                if !crate::screen::native_capture() && !crate::screen::ffmpeg_available() {
                     self.notify(Notice::error(crate::screen::ffmpeg::advice()));
                     return;
                 }
-                // The app asks for the permission itself rather than leaving it to whatever ffmpeg
-                // triggers — and it has to happen *before* anything is announced, because macOS will
-                // not grant it to a process that is already running.
+                // The app asks for the permission itself rather than leaving it to the capture — and it
+                // has to happen *before* anything is announced, because macOS will not grant it to a
+                // process that is already running.
                 match crate::platform::request_screen_access() {
                     crate::platform::ScreenAccess::Granted
                     | crate::platform::ScreenAccess::Unknown => {}

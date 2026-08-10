@@ -24,6 +24,7 @@
 //! and the [`Mutex`] around the encoder is what makes the arrangement sound rather than hopeful — the
 //! queue is serial, so it is never actually contended.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,7 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
@@ -64,6 +66,8 @@ pub struct Capture {
     /// Where finished pictures arrive. Taken out by [`Capture::pictures`] so the sending thread can
     /// wait on it rather than poll — after which [`Capture::take`] has nothing to give.
     pictures: Option<Receiver<Picture>>,
+    /// The machine's own sound, as interleaved stereo at 48 kHz, when it was asked for.
+    sound: Option<Receiver<Vec<f32>>>,
     frames: Arc<AtomicU64>,
     trouble: Arc<Mutex<Option<String>>>,
     /// The size the stream was configured at, which is what the far side is told to expect.
@@ -78,7 +82,18 @@ unsafe impl Send for Capture {}
 
 impl Capture {
     /// Start capturing `target`, scaled to fit within `width`×`height`.
-    pub fn start(target: Target, width: u32, height: u32, fps: u32, kbps: u32) -> Result<Capture> {
+    ///
+    /// With `sound`, the stream also carries the machine's own output — every process's audio except
+    /// this one's. That exclusion is the whole reason this is worth doing rather than reading a loopback
+    /// device: a loopback hears the call it is in, so everybody in it hears themselves back.
+    pub fn start(
+        target: Target,
+        width: u32,
+        height: u32,
+        fps: u32,
+        kbps: u32,
+        sound: bool,
+    ) -> Result<Capture> {
         let located = content::locate(target).map_err(|why| anyhow!("{why}"))?;
         let (native_width, native_height) = located.pixels();
         let (width, height) = fit(native_width, native_height, width, height);
@@ -88,10 +103,20 @@ impl Capture {
 
         let frames = Arc::new(AtomicU64::new(0));
         let trouble = Arc::new(Mutex::new(None));
-        let output = Output::new(encoder, frames.clone(), trouble.clone());
+
+        // The sound, when it was asked for: a channel of interleaved stereo, which is what the Opus
+        // encoder on the other end of it wants. A shallow queue — a share whose sound is a second
+        // behind is worse than one that dropped a moment of it.
+        let (sound_tx, sound_rx) = if sound {
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let output = Output::new(encoder, frames.clone(), trouble.clone(), sound_tx);
 
         let filter = filter(&located);
-        let configuration = configure(width, height, fps);
+        let configuration = configure(width, height, fps, sound);
 
         // SAFETY: the filter and configuration are ours and fully initialised; the delegate outlives
         // the stream because `Capture` holds both and drops the stream first.
@@ -123,6 +148,28 @@ impl Capture {
                 .context("attaching the screen output")?;
         }
 
+        // The sound is a second output on a queue of its own. Sharing the video queue would put the
+        // Opus path behind whatever the encoder is doing with a 4K frame, and audio is the one of the
+        // two that nobody forgives being late.
+        if sound {
+            let queue = DispatchQueue::new("dev.boavoice.screen.audio", DispatchQueueAttr::SERIAL);
+            // SAFETY: as above.
+            let attached = unsafe {
+                let sink = ProtocolObject::<dyn SCStreamOutput>::from_ref(&*output);
+                stream.addStreamOutput_type_sampleHandlerQueue_error(
+                    sink,
+                    SCStreamOutputType::Audio,
+                    Some(&queue),
+                )
+            };
+            // Not fatal. A share with a picture and no sound is worth having; refusing to share at all
+            // because the sound could not be attached is not.
+            if let Err(error) = attached {
+                log::warn!("screen: no desktop audio: {}", error.localizedDescription());
+                crate::diagnostics::note("screen: the sound output was refused");
+            }
+        }
+
         start(&stream)?;
         log::info!(
             "screen: capturing {} at {width}×{height} ({native_width}×{native_height} native), \
@@ -133,7 +180,16 @@ impl Capture {
             "screen: ScreenCaptureKit {width}×{height} at {fps} fps"
         ));
 
-        Ok(Capture { stream, output, pictures: Some(rx), frames, trouble, width, height })
+        Ok(Capture {
+            stream,
+            output,
+            pictures: Some(rx),
+            sound: sound_rx,
+            frames,
+            trouble,
+            width,
+            height,
+        })
     }
 
     /// The next encoded picture, if one is ready and nobody has taken the channel over.
@@ -147,6 +203,11 @@ impl Capture {
     /// which is the sort of bug that looks like a slow network.
     pub fn pictures(&mut self) -> Option<Receiver<Picture>> {
         self.pictures.take()
+    }
+
+    /// Take the sound channel, if this capture has one. Once, like [`Capture::pictures`].
+    pub fn sound(&mut self) -> Option<Receiver<Vec<f32>>> {
+        self.sound.take()
     }
 
     /// How many frames the window server has delivered.
@@ -238,7 +299,7 @@ fn filter(located: &Located) -> Retained<SCContentFilter> {
 }
 
 /// The stream configuration.
-fn configure(width: u32, height: u32, fps: u32) -> Retained<SCStreamConfiguration> {
+fn configure(width: u32, height: u32, fps: u32, sound: bool) -> Retained<SCStreamConfiguration> {
     // SAFETY: a plain allocation, and then property setters on the object it returns.
     let configuration = unsafe { SCStreamConfiguration::new() };
     unsafe {
@@ -264,6 +325,18 @@ fn configure(width: u32, height: u32, fps: u32) -> Retained<SCStreamConfiguratio
         // edges off is worse than one that is smaller than asked for.
         configuration.setScalesToFit(true);
         configuration.setPreservesAspectRatio(true);
+
+        if sound {
+            configuration.setCapturesAudio(true);
+            // **Without this the call feeds back.** The share would carry the voices coming out of this
+            // app's own speakers, so everybody in the call would hear themselves a moment late. This
+            // one line is what a loopback device cannot do.
+            configuration.setExcludesCurrentProcessAudio(true);
+            // The rate and channel count the Opus encoder downstream is configured for. Asking here
+            // means the framework resamples rather than this code.
+            configuration.setSampleRate(boa_proto::media::VOICE_SAMPLE_RATE as isize);
+            configuration.setChannelCount(2);
+        }
     }
     configuration
 }
@@ -296,6 +369,9 @@ pub struct Ivars {
     trouble: Arc<Mutex<Option<String>>>,
     /// Set when the next frame should be a keyframe, cleared when it has been asked for.
     keyframe: std::sync::atomic::AtomicBool,
+    /// Where the machine's sound goes. Reached from the audio queue, which is a different thread from
+    /// the video one — hence a channel rather than shared state.
+    sound: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 }
 
 define_class!(
@@ -319,6 +395,10 @@ define_class!(
             sample: &CMSampleBuffer,
             kind: SCStreamOutputType,
         ) {
+            if kind == SCStreamOutputType::Audio {
+                self.did_hear(sample);
+                return;
+            }
             if kind != SCStreamOutputType::Screen {
                 return;
             }
@@ -356,16 +436,119 @@ define_class!(
     }
 );
 
+/// An `AudioBufferList` with room for two buffers.
+///
+/// The framework's own type has room for exactly one, because the real thing is variable-length and C
+/// expresses that by lying about the array size. Stereo arrives as *two* buffers — one per channel —
+/// so a call handed the declared type would have the second buffer written past the end of it. This is
+/// the same layout with the array it actually needs.
+#[repr(C)]
+struct TwoBuffers {
+    count: u32,
+    buffers: [objc2_core_audio_types::AudioBuffer; 2],
+}
+
 impl Output {
+    /// One buffer of the machine's own sound.
+    ///
+    /// ScreenCaptureKit delivers **deinterleaved** floats: one buffer per channel, each a run of samples
+    /// for that channel alone. Opus wants them interleaved, left and right alternating, so that is what
+    /// this does — and it is the whole job, because the sample rate and channel count were asked for in
+    /// the configuration.
+    fn did_hear(&self, sample: &CMSampleBuffer) {
+        let Some(sound) = self.ivars().sound.as_ref() else { return };
+
+        let mut list = TwoBuffers {
+            count: 2,
+            buffers: [objc2_core_audio_types::AudioBuffer {
+                mNumberChannels: 0,
+                mDataByteSize: 0,
+                mData: std::ptr::null_mut(),
+            }; 2],
+        };
+        let mut block: *mut objc2_core_media::CMBlockBuffer = std::ptr::null_mut();
+
+        // SAFETY: the list is the right size for the two buffers it declares, and the block buffer this
+        // retains is released below — the "retained" in the name is the caller's job, and leaking it
+        // would leak an audio buffer twenty times a second.
+        let status = unsafe {
+            sample.audio_buffer_list_with_retained_block_buffer(
+                std::ptr::null_mut(),
+                &mut list as *mut TwoBuffers as *mut objc2_core_audio_types::AudioBufferList,
+                std::mem::size_of::<TwoBuffers>(),
+                None,
+                None,
+                0,
+                &mut block,
+            )
+        };
+        // SAFETY: on success this is a retained block buffer; taking it into `CFRetained` releases it
+        // when this function returns.
+        let block = unsafe { NonNull::new(block).map(|block| CFRetained::from_raw(block)) };
+        if status != 0 {
+            log::debug!("screen: could not read a sound buffer (status {status})");
+            return;
+        }
+
+        let buffers = &list.buffers[..(list.count as usize).min(2)];
+        let samples: Vec<&[f32]> = buffers
+            .iter()
+            .filter(|buffer| !buffer.mData.is_null())
+            // SAFETY: the framework reports how many bytes are behind each pointer, and they are floats
+            // because the configuration asked for a float format. The slices live as long as `block`.
+            .map(|buffer| unsafe {
+                std::slice::from_raw_parts(
+                    buffer.mData as *const f32,
+                    buffer.mDataByteSize as usize / 4,
+                )
+            })
+            .collect();
+
+        let interleaved = match samples.as_slice() {
+            // Stereo, deinterleaved: the usual case.
+            [left, right] => {
+                let frames = left.len().min(right.len());
+                let mut out = Vec::with_capacity(frames * 2);
+                for index in 0..frames {
+                    out.push(left[index]);
+                    out.push(right[index]);
+                }
+                out
+            }
+            // One buffer. Either mono, which is doubled so it comes out of both speakers, or already
+            // interleaved stereo, which is passed through — the channel count says which.
+            [only] => {
+                if buffers[0].mNumberChannels >= 2 {
+                    only.to_vec()
+                } else {
+                    only.iter().flat_map(|sample| [*sample, *sample]).collect()
+                }
+            }
+            _ => return,
+        };
+        drop(block);
+
+        if interleaved.is_empty() {
+            return;
+        }
+        // Dropped rather than waited for. This is a framework callback: blocking it stalls the audio
+        // path inside the window server's client, and a moment of missing sound beats that.
+        if sound.try_send(interleaved).is_err() {
+            log::trace!("screen: dropped a sound buffer");
+        }
+    }
+
     fn new(
         encoder: Encoder,
         frames: Arc<AtomicU64>,
         trouble: Arc<Mutex<Option<String>>>,
+        sound: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
     ) -> Retained<Output> {
         let this = Output::alloc().set_ivars(Ivars {
             encoder: Mutex::new(encoder),
             frames,
             trouble,
+            sound,
             // The first frame: a stream whose first picture is not a keyframe is a stream nobody can
             // start watching.
             keyframe: std::sync::atomic::AtomicBool::new(true),
@@ -415,7 +598,7 @@ mod tests {
         };
         let target = content::target(screen).expect("a screen source is addressable");
 
-        let capture = match Capture::start(target, 1280, 720, 30, 2_000) {
+        let mut capture = match Capture::start(target, 1280, 720, 30, 2_000, true) {
             Ok(capture) => capture,
             Err(err) => {
                 eprintln!("no capture here: {err:#}");
@@ -423,6 +606,9 @@ mod tests {
             }
         };
         assert!(capture.width <= 1280 && capture.height <= 720);
+        // Asked for sound, so there has to be a channel for it — whether anything is playing on this
+        // machine is not something a test can arrange.
+        let sound = capture.sound().expect("a capture asked for sound has a sound channel");
 
         // Up to three seconds. The framework delivers a frame when the screen changes, and a test
         // machine with nothing moving on it can take a moment to produce the first one.
@@ -437,6 +623,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(capture.trouble().is_none(), "{:?}", capture.trouble());
+
+        // Whatever sound did arrive has to be interleaved stereo: an odd number of samples means the
+        // channels have been read wrongly, and that is a stream that plays as noise.
+        while let Ok(samples) = sound.try_recv() {
+            assert_eq!(samples.len() % 2, 0, "not interleaved stereo: {} samples", samples.len());
+            assert!(samples.iter().all(|sample| sample.is_finite()), "sound with no numbers in it");
+        }
 
         let keyframe = keyframe.expect("a keyframe within three seconds");
         assert_eq!(&keyframe.data[..4], &[0, 0, 0, 1], "Annex-B starts with a start code");

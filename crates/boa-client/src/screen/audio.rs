@@ -1,28 +1,29 @@
 //! The sound of the machine you are sharing, sent along with the picture.
 //!
-//! This is harder than it sounds, and not for a technical reason: **no desktop operating system lets
-//! a program record its own output without help.** Microphones have a permission model; system audio
-//! mostly has nothing at all, because it was never a thing applications were expected to do. So each
-//! platform needs a different arrangement, and two of the three need something installed:
+//! This is harder than it sounds, and not for a technical reason: **most desktop operating systems do
+//! not let a program record their output without help.** Microphones have a permission model; system
+//! audio mostly has nothing at all, because it was never a thing applications were expected to do. So
+//! there are two ways in here, and where the good one is available it is the one used:
 //!
-//! * **macOS** — a virtual output device that loops back to an input. [BlackHole] is the usual free
-//!   one; Loopback and (historically) Soundflower do the same job. Once one exists, the machine's
-//!   output is routed through it and ffmpeg reads it as an ordinary input.
+//! * **macOS** — the screen capture itself hands it over. ScreenCaptureKit's stream carries audio
+//!   under the same screen-recording permission, so there is nothing to install; see
+//!   [`DesktopAudio::from_stream`] and the `excludesCurrentProcessAudio` note there, which is the part
+//!   a loopback device cannot do. A Mac without that framework falls back to the route below.
 //! * **Linux** — PulseAudio and PipeWire both expose a *monitor source* per output, which is exactly
-//!   this and needs nothing installed. The best-supported platform for once.
+//!   this and needs nothing installed.
 //! * **Windows** — WASAPI can do loopback capture natively, but ffmpeg's Windows input does not
 //!   expose it, so it needs a virtual device (`virtual-audio-capturer`, from the
-//!   screen-capture-recorder package) or a cable.
+//!   screen-capture-recorder package) or a cable. A loopback device is also the macOS fallback:
+//!   [BlackHole] is the usual free one.
 //!
 //! [`find_loopback`] looks for whatever is there and, when there is nothing, returns advice rather
 //! than an error — because "your share has no sound" with no explanation is the worst outcome, and
 //! the fix is a five-minute install.
 //!
-//! The audio is a **second ffmpeg process**, not a second stream in the video one. Multiplexing both
-//! into a container and demuxing it in Rust would add a container format and a demuxer to the
-//! critical path, to synchronise two things that are separately timestamped on the wire anyway. Two
-//! processes, one reading a display and one reading a device, is less machinery and fails
-//! independently: a machine with no loopback device still shares its screen.
+//! Either way the sound is a **separate stream** rather than being multiplexed with the picture.
+//! Putting both in a container and demuxing it in Rust would add a container format and a demuxer to
+//! the critical path, to synchronise two things that are separately timestamped on the wire anyway —
+//! and this way a machine that cannot capture its output still shares its screen.
 //!
 //! [BlackHole]: https://existential.audio/blackhole/
 
@@ -183,9 +184,93 @@ fn pulse_monitor() -> Loopback {
     Loopback { format: "pulse", label: input.clone(), input }
 }
 
-/// A running desktop-audio stream. Dropping it stops ffmpeg and the sending thread.
+/// Interleaved stereo floats in, sealed Opus packets on the wire.
+///
+/// The part both sources of desktop audio share. ffmpeg delivers these samples through a pipe and
+/// ScreenCaptureKit through a callback, and from here on the two are the same thing — one Opus
+/// configuration, one packet cadence, one place where the sequence number lives.
+struct Packer {
+    encoder: opus::Encoder,
+    transport: Transport,
+    ssrc: u32,
+    packets: Arc<AtomicU64>,
+    /// Samples that did not fill a packet. Audio arrives in whatever size its source felt like and a
+    /// packet is exactly 20 ms, so there is nearly always a remainder.
+    pending: Vec<f32>,
+    encoded: Vec<u8>,
+    scratch: Vec<u8>,
+    seq: u32,
+    timestamp: u32,
+}
+
+impl Packer {
+    fn new(transport: Transport, ssrc: u32, packets: Arc<AtomicU64>) -> Result<Packer> {
+        let mut encoder = opus::Encoder::new(
+            VOICE_SAMPLE_RATE,
+            opus::Channels::Stereo,
+            // `Audio`, not `Voip`. The opposite of the voice path, and deliberately: this is music and
+            // game audio, where the codec should preserve the full band rather than optimise for
+            // intelligibility.
+            opus::Application::Audio,
+        )
+        .map_err(|err| anyhow!("starting the desktop audio encoder: {err}"))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(DESKTOP_BITRATE))
+            .map_err(|err| anyhow!("setting the bitrate: {err}"))?;
+
+        Ok(Packer {
+            encoder,
+            transport,
+            ssrc,
+            packets,
+            pending: Vec::with_capacity(FRAME_SAMPLES * 2),
+            encoded: vec![0u8; 4_000],
+            scratch: Vec::with_capacity(1_200),
+            seq: 0,
+            timestamp: 0,
+        })
+    }
+
+    /// Take some interleaved stereo samples and send whatever whole packets they complete.
+    fn feed(&mut self, samples: &[f32]) {
+        self.pending.extend_from_slice(samples);
+        while self.pending.len() >= FRAME_SAMPLES {
+            let length = match self.encoder.encode_float(&self.pending[..FRAME_SAMPLES], &mut self.encoded)
+            {
+                Ok(length) => length,
+                Err(err) => {
+                    log::warn!("screen: encoding desktop audio: {err}");
+                    self.pending.drain(..FRAME_SAMPLES);
+                    continue;
+                }
+            };
+            self.pending.drain(..FRAME_SAMPLES);
+
+            self.seq = self.seq.wrapping_add(1);
+            // In samples per channel, which is what a decoder's clock counts — not interleaved
+            // samples, and getting that wrong makes a stream that plays at half speed.
+            self.timestamp = self.timestamp.wrapping_add(VOICE_FRAME_SAMPLES as u32);
+            let header = PacketHeader {
+                kind: MediaKind::DesktopAudio,
+                ssrc: self.ssrc,
+                seq: self.seq,
+                timestamp: self.timestamp,
+            };
+            match self.transport.send(header, &self.encoded[..length], &mut self.scratch) {
+                Ok(()) => {
+                    self.packets.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => log::debug!("screen: sending desktop audio: {err:#}"),
+            }
+        }
+    }
+}
+
+/// A running desktop-audio stream. Dropping it stops the capture and the sending thread.
 pub struct DesktopAudio {
-    child: Arc<std::sync::Mutex<Child>>,
+    /// The ffmpeg reading a loopback device, where that is what this is. `None` when the sound is
+    /// coming from the screen capture itself, which has no process of its own.
+    child: Option<Arc<std::sync::Mutex<Child>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub packets: Arc<AtomicU64>,
@@ -227,7 +312,7 @@ impl DesktopAudio {
             std::thread::Builder::new()
                 .name("boa-desktop-audio".into())
                 .spawn(move || {
-                    if let Err(err) = pump(stdout, &transport, ssrc, &stop, &packets) {
+                    if let Err(err) = pump(stdout, transport, ssrc, &stop, packets) {
                         log::error!("screen: desktop audio stopped: {err:#}");
                         crate::diagnostics::note(&format!("screen: desktop audio stopped: {err:#}"));
                     }
@@ -236,11 +321,54 @@ impl DesktopAudio {
         };
 
         Ok(DesktopAudio {
-            child: Arc::new(std::sync::Mutex::new(child)),
+            child: Some(Arc::new(std::sync::Mutex::new(child))),
             stop,
             thread: Some(thread),
             packets,
             device: loopback.label.clone(),
+        })
+    }
+
+    /// Send the sound a screen capture is already producing.
+    ///
+    /// This is the arrangement the app wants on macOS and the reason the loopback hunt above exists at
+    /// all: ScreenCaptureKit hands over the machine's own output, minus this app's own, under the
+    /// permission the share already needed. Nothing to install, and nothing that can be left switched
+    /// on afterwards — a loopback device stays the default output until somebody puts it back.
+    pub fn from_stream(
+        transport: Transport,
+        ssrc: u32,
+        sound: std::sync::mpsc::Receiver<Vec<f32>>,
+    ) -> Result<DesktopAudio> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let packets = Arc::new(AtomicU64::new(0));
+        let mut packer = Packer::new(transport, ssrc, packets.clone())?;
+
+        let thread = {
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("boa-desktop-audio".into())
+                .spawn(move || {
+                    use std::sync::mpsc::RecvTimeoutError;
+                    while !stop.load(Ordering::Acquire) {
+                        match sound.recv_timeout(std::time::Duration::from_millis(200)) {
+                            Ok(samples) => packer.feed(&samples),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            // The capture has gone, which is how a share ends.
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                })
+                .context("spawning the desktop audio sender")?
+        };
+
+        crate::diagnostics::note("screen: desktop audio from ScreenCaptureKit");
+        Ok(DesktopAudio {
+            child: None,
+            stop,
+            thread: Some(thread),
+            packets,
+            device: "this machine's own output".to_string(),
         })
     }
 }
@@ -248,9 +376,11 @@ impl DesktopAudio {
 impl Drop for DesktopAudio {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = &self.child {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -286,36 +416,20 @@ fn capture_args(loopback: &Loopback) -> Vec<String> {
     ]
 }
 
-/// Read PCM, encode, send.
+/// Read PCM from ffmpeg, encode, send.
 fn pump(
     mut stdout: std::process::ChildStdout,
-    transport: &Transport,
+    transport: Transport,
     ssrc: u32,
     stop: &AtomicBool,
-    packets: &AtomicU64,
+    packets: Arc<AtomicU64>,
 ) -> Result<()> {
-    let mut encoder = opus::Encoder::new(
-        VOICE_SAMPLE_RATE,
-        opus::Channels::Stereo,
-        // `Audio`, not `Voip`. The opposite of the voice path, and deliberately: this is music and
-        // game audio, where the codec should preserve the full band rather than optimise for
-        // intelligibility.
-        opus::Application::Audio,
-    )
-    .map_err(|err| anyhow!("starting the desktop audio encoder: {err}"))?;
-    encoder
-        .set_bitrate(opus::Bitrate::Bits(DESKTOP_BITRATE))
-        .map_err(|err| anyhow!("setting the bitrate: {err}"))?;
-
-    // Bytes from the pipe, which arrive in whatever size the pipe felt like — never a whole number
-    // of frames, hence the leftover buffer.
+    let mut packer = Packer::new(transport, ssrc, packets)?;
+    // Bytes from the pipe, which arrive in whatever size the pipe felt like — never a whole number of
+    // samples, hence the four-byte remainder carried between reads.
     let mut raw = vec![0u8; 16 * 1024];
-    let mut leftover: Vec<u8> = Vec::with_capacity(4 * FRAME_SAMPLES + 4);
-    let mut pcm = vec![0.0f32; FRAME_SAMPLES];
-    let mut encoded = vec![0u8; 4_000];
-    let mut scratch = Vec::with_capacity(1_200);
-    let mut seq: u32 = 0;
-    let mut timestamp: u32 = 0;
+    let mut odd: Vec<u8> = Vec::with_capacity(4);
+    let mut samples: Vec<f32> = Vec::with_capacity(4 * 1024);
 
     while !stop.load(Ordering::Acquire) {
         let read = stdout.read(&mut raw).context("reading desktop audio from ffmpeg")?;
@@ -323,40 +437,32 @@ fn pump(
             log::info!("screen: desktop audio finished");
             return Ok(());
         }
-        leftover.extend_from_slice(&raw[..read]);
 
-        // Four bytes per sample, two samples per frame.
-        let bytes_per_packet = FRAME_SAMPLES * 4;
-        while leftover.len() >= bytes_per_packet {
-            for (slot, chunk) in
-                pcm.iter_mut().zip(leftover[..bytes_per_packet].chunks_exact(4))
-            {
-                *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            }
-            leftover.drain(..bytes_per_packet);
-
-            let length = match encoder.encode_float(&pcm, &mut encoded) {
-                Ok(length) => length,
-                Err(err) => {
-                    log::warn!("screen: encoding desktop audio: {err}");
-                    continue;
-                }
-            };
-            seq = seq.wrapping_add(1);
-            timestamp = timestamp.wrapping_add(VOICE_FRAME_SAMPLES as u32);
-            let header =
-                PacketHeader { kind: MediaKind::DesktopAudio, ssrc, seq, timestamp };
-            match transport.send(header, &encoded[..length], &mut scratch) {
-                Ok(()) => {
-                    packets.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(err) => log::debug!("screen: sending desktop audio: {err:#}"),
+        samples.clear();
+        let mut bytes = raw[..read].iter().copied();
+        // Whatever was left over from the last read comes first, or one sample in every few thousand
+        // is a splice of two halves and the stream clicks.
+        while odd.len() < 4 {
+            match bytes.next() {
+                Some(byte) => odd.push(byte),
+                None => break,
             }
         }
+        if odd.len() == 4 {
+            samples.push(f32::from_le_bytes([odd[0], odd[1], odd[2], odd[3]]));
+            odd.clear();
+        }
+        let rest: Vec<u8> = bytes.collect();
+        let whole = rest.len() / 4 * 4;
+        for chunk in rest[..whole].chunks_exact(4) {
+            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        odd.extend_from_slice(&rest[whole..]);
+
+        packer.feed(&samples);
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

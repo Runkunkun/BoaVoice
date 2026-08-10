@@ -177,8 +177,9 @@ than merging into it, and re-signs it there. Quit a running copy first, or it ke
 the old binary. macOS asks for microphone access on the first call, and again after the bundle
 is replaced — the permission is remembered per bundle path and signature.
 
-**Sharing a screen needs `ffmpeg` on the PATH. Watching one does not.** See
-[Screen sharing](#screen-sharing-and-why-ffmpeg).
+**On macOS, sharing a screen needs nothing installed** — it uses ScreenCaptureKit and the hardware
+H.264 encoder, and asks for the screen-recording permission itself. On Linux and Windows, sharing
+needs `ffmpeg`; watching one never does. See [Screen sharing](#screen-sharing).
 
 Settings and saved attachments live in `~/Library/Application Support/BoaVoice` (macOS),
 `~/.local/share/BoaVoice` (Linux) or `%APPDATA%\BoaVoice` (Windows).
@@ -274,41 +275,65 @@ SHA-256 — lives forever.
 The knob is `--max-upload-mb` on the server (default 64) and a retention setting in the client,
 which defaults to keeping everything forever.
 
-### Screen sharing, and why ffmpeg
+### Screen sharing
 
 Screen capture is the one job here with no portable Rust answer: it is ScreenCaptureKit on macOS,
-X11 or PipeWire on Linux and DXGI on Windows, each with its own permission model. The crate that
-wraps all three could not be used — it pulls a second, incompatible ALSA binding and collides with
-the audio stack — and writing three backends by hand is a project of its own. ffmpeg already does
-it on all three, and while it is there it does the scaling and the H.264 encoding with hardware
-acceleration.
+X11 or PipeWire on Linux and DXGI on Windows, each with its own permission model. So there are two
+engines, and which one runs follows from the source rather than from a setting.
 
-So **sharing needs ffmpeg installed; watching does not.** The decoder is openh264, in-process,
-built from source with the crate.
+**macOS: in-process.** ScreenCaptureKit for the capture, VideoToolbox for the H.264 — both part of
+the operating system, so a Mac needs nothing installed. It is what makes three things possible that
+ffmpeg could not do here:
+
+* **A single window**, not just a whole screen. ffmpeg's avfoundation input captures displays and
+  nothing smaller, so the choice did not exist.
+* **The machine's own sound** with no loopback device, under the same permission (see below).
+* **The right resolution.** The framework reports sizes in points; the capture is configured in
+  pixels, so a Retina screen is shared at its native resolution rather than half of it.
+
+It is written against the `objc2` bindings directly rather than through the ergonomic
+ScreenCaptureKit wrapper crate, which builds Swift helper libraries and would make a full Xcode
+install a requirement for anybody compiling this app.
+
+**Everywhere else: ffmpeg**, which also does the scaling and the encoding with hardware
+acceleration. So **sharing on Linux and Windows needs ffmpeg installed; watching never does.** The
+decoder is openh264, in-process, built from source with the crate. macOS falls back to this path
+too, if ScreenCaptureKit cannot be reached at all.
+
+`cargo run --example sckcheck` lists what macOS says can be shared, and given one of those names
+captures it for three seconds and reports what came out of the encoder — which also answers whether
+the screen-recording permission is granted *to that binary*, since macOS grants it per executable.
 
 Wayland is not supported for sharing (the X11 path fails under it, with the reason in the log).
 
 ### Desktop audio
 
-Sharing the machine's own sound is harder than it sounds, and not for a technical reason: **no
-desktop operating system lets a program record its own output without help.** Microphones have a
-permission model; system audio mostly has nothing at all, because it was never something
-applications were expected to do. So:
+Sharing the machine's own sound used to be harder than it sounds, and not for a technical reason:
+**most desktop operating systems do not let a program record their output without help.**
+Microphones have a permission model; system audio mostly has nothing at all, because it was never
+something applications were expected to do. So:
 
 | | what is needed |
 |---|---|
+| **macOS** | nothing — ScreenCaptureKit hands over the machine's output under the screen-recording permission the share already asked for |
 | **Linux** | nothing — PulseAudio and PipeWire expose a monitor source per output |
-| **macOS** | a loopback device: `brew install blackhole-2ch`, then route the output through it (a Multi-Output Device in Audio MIDI Setup lets you hear it too) |
 | **Windows** | a virtual device — `virtual-audio-capturer` from the screen-capture-recorder package, or a cable |
 
-`cargo run --example loopbackcheck` says what this machine has and what to install if it has
-nothing. A machine with no loopback device still shares its screen; the interface says why there
-is no sound rather than leaving you to notice.
+On macOS the sound is a second output of the same capture, and one line of its configuration is
+doing work no loopback device can do: `excludesCurrentProcessAudio`. A loopback device hears
+everything, including the call it is in, so everybody in the call would hear themselves back a
+moment late. Excluding this app's own audio is what makes the share carry the game and not the
+conversation about it.
 
-The audio is a **second ffmpeg process**, not a second stream in the video one. Multiplexing both
-into a container and demuxing it in Rust would add a format and a demuxer to the critical path in
-order to synchronise two things that are separately timestamped on the wire anyway — and this way
-a machine with no loopback device still shares its picture.
+Where a loopback device *is* needed, `cargo run --example loopbackcheck` says what this machine has
+and what to install. A machine with no way to capture its output still shares its screen; the
+interface says why there is no sound rather than leaving you to notice.
+
+Either way the sound is a **separate stream** beside the picture, not multiplexed with it:
+stereo Opus at 96 kbit/s on the same socket and the same stream id. Putting both in a container
+would add a format and a demuxer to the critical path in order to synchronise two things that are
+separately timestamped on the wire anyway — and this way a machine that cannot capture its output
+still shares its picture.
 
 ## Decisions worth knowing about
 

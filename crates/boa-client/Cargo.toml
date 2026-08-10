@@ -95,6 +95,9 @@ objc2-core-foundation = { version = "0.3", features = [
 ] }
 objc2-core-media = { version = "0.3", features = [
     "CMBase",
+    # The machine's own sound arrives as an `AudioBufferList` hanging off a sample buffer, and reading
+    # one needs both of these.
+    "objc2-core-audio-types",
     "CMBlockBuffer",
     "CMFormatDescription",
     "CMSampleBuffer",
@@ -129,6 +132,8 @@ objc2-screen-capture-kit = { version = "0.3", features = [
 ] }
 # How many pixels a display actually has, which is not what ScreenCaptureKit reports: its sizes are in
 # points, and capturing a Retina screen at its point size is a visibly soft picture.
+# The layout of an `AudioBufferList`, which is how ScreenCaptureKit hands over the machine's sound.
+objc2-core-audio-types = "0.3"
 objc2-core-graphics = { version = "0.3", features = ["CGDirectDisplay", "CGDisplayConfiguration"] }
 # The hardware H.264 encoder. Replacing ffmpeg with this is what removes a 76 MB GPL binary from the
 # app rather than shipping one.

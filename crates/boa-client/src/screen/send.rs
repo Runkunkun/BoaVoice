@@ -218,23 +218,9 @@ impl Share {
         height: u32,
         preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
     ) -> Result<Share> {
-        // The audio goes first, because it is the part that can be *unavailable* rather than broken:
-        // finding out before the picture starts means the user is told once, at the moment they
-        // pressed the button, instead of wondering later.
-        let (audio, audio_problem) = if settings.with_audio {
-            match super::find_loopback() {
-                Ok(loopback) => match transport
-                    .try_clone()
-                    .and_then(|transport| super::DesktopAudio::start(transport, ssrc, &loopback))
-                {
-                    Ok(audio) => (Some(audio), None),
-                    Err(err) => (None, Some(format!("{err}"))),
-                },
-                Err(advice) => (None, Some(advice)),
-            }
-        } else {
-            (None, None)
-        };
+        // A second socket for the sound, taken before the transport is moved into the wiring. It is the
+        // same socket and the same session key — a clone of the handle, not a second connection.
+        let for_audio = if settings.with_audio { transport.try_clone().ok() } else { None };
 
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
@@ -254,7 +240,7 @@ impl Share {
         // share of nothing.
         #[cfg(target_os = "macos")]
         if let Some(target) = super::mac::content::target(source) {
-            let started = native(target, settings, width, height, wiring)?;
+            let started = native(target, settings, width, height, wiring, ssrc, for_audio)?;
             return Ok(Share {
                 engine: started.engine,
                 stop,
@@ -264,10 +250,25 @@ impl Share {
                 started: Instant::now(),
                 width: started.width,
                 height: started.height,
-                audio,
-                audio_problem,
+                audio: started.audio,
+                audio_problem: started.audio_problem,
             });
         }
+
+        // ffmpeg's sound comes from a loopback device, and it is looked for *first*: it is the part that
+        // can be unavailable rather than broken, and finding out before the picture starts means the
+        // user is told once, at the moment they pressed the button, instead of wondering later.
+        let (audio, audio_problem) = match (settings.with_audio, for_audio) {
+            (true, Some(transport)) => match super::find_loopback() {
+                Ok(loopback) => match super::DesktopAudio::start(transport, ssrc, &loopback) {
+                    Ok(audio) => (Some(audio), None),
+                    Err(err) => (None, Some(format!("{err}"))),
+                },
+                Err(advice) => (None, Some(advice)),
+            },
+            (true, None) => (None, Some("the media socket could not be shared".to_string())),
+            (false, _) => (None, None),
+        };
 
         let started = spawn_ffmpeg(settings, source, width, height, wiring)?;
         Ok(Share {
@@ -291,6 +292,10 @@ struct Started {
     thread: std::thread::JoinHandle<()>,
     width: u32,
     height: u32,
+    /// The sound, where the engine produced it. ffmpeg's is arranged by the caller instead, because it
+    /// is a separate process and a separate device.
+    audio: Option<super::DesktopAudio>,
+    audio_problem: Option<String>,
 }
 
 /// Everything the sending thread needs, whichever engine produced the pictures.
@@ -311,20 +316,45 @@ fn native(
     width: u32,
     height: u32,
     wiring: Wiring,
+    ssrc: u32,
+    for_audio: Option<Transport>,
 ) -> Result<Started> {
-    let mut capture =
-        super::mac::capture::Capture::start(target, width, height, settings.fps, settings.kbps)?;
+    let want_sound = settings.with_audio && for_audio.is_some();
+    let mut capture = super::mac::capture::Capture::start(
+        target,
+        width,
+        height,
+        settings.fps,
+        settings.kbps,
+        want_sound,
+    )?;
     let (width, height) = (capture.width, capture.height);
     let pictures = capture
         .pictures()
         .ok_or_else(|| anyhow!("the capture has already been taken over"))?;
+
+    // The sound comes out of the same stream, so there is nothing to look for and nothing to install —
+    // which is the entire point of this engine. It can still fail, and a share with a picture and no
+    // sound is worth having, so a failure is a sentence rather than an error.
+    let (audio, audio_problem) = match (for_audio, capture.sound()) {
+        (Some(transport), Some(sound)) => {
+            match super::DesktopAudio::from_stream(transport, ssrc, sound) {
+                Ok(audio) => (Some(audio), None),
+                Err(err) => (None, Some(format!("{err}"))),
+            }
+        }
+        (Some(_), None) if settings.with_audio => {
+            (None, Some("the capture produced no sound output".to_string()))
+        }
+        _ => (None, None),
+    };
 
     let thread = std::thread::Builder::new()
         .name("boa-screen-tx".into())
         .spawn(move || pump_pictures(pictures, wiring))
         .context("spawning the screen sender")?;
 
-    Ok(Started { engine: Engine::Native(capture), thread, width, height })
+    Ok(Started { engine: Engine::Native(capture), thread, width, height, audio, audio_problem })
 }
 
 /// Capture with ffmpeg, as a child process.
@@ -386,6 +416,9 @@ fn spawn_ffmpeg(
         thread,
         width,
         height,
+        // ffmpeg's sound is started by the caller, from a loopback device.
+        audio: None,
+        audio_problem: None,
     })
 }
 

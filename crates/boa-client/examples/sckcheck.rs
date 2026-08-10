@@ -76,7 +76,7 @@ fn capture(wanted: &str) {
     };
 
     println!();
-    let capture = match Capture::start(target, 1920, 1080, 30, 4_000) {
+    let mut capture = match Capture::start(target, 1920, 1080, 30, 4_000, true) {
         Ok(capture) => capture,
         Err(err) => {
             println!("could not capture: {err:#}");
@@ -84,10 +84,22 @@ fn capture(wanted: &str) {
         }
     };
     println!("capturing at {}×{} for three seconds…", capture.width, capture.height);
+    println!("play something to check the sound — this app's own audio is deliberately excluded.");
+    let sound = capture.sound();
 
     let (mut pictures, mut keyframes, mut bytes) = (0u64, 0u64, 0usize);
+    let (mut buffers, mut samples, mut peak) = (0u64, 0usize, 0.0f32);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
+        // Drained as it arrives, not at the end: the channel is deliberately shallow, so a reader that
+        // waits until afterwards measures the queue's size rather than what was captured.
+        if let Some(sound) = sound.as_ref() {
+            while let Ok(chunk) = sound.try_recv() {
+                buffers += 1;
+                samples += chunk.len();
+                peak = peak.max(chunk.iter().fold(0.0f32, |loudest, s| loudest.max(s.abs())));
+            }
+        }
         match capture.take() {
             Some(picture) => {
                 pictures += 1;
@@ -105,6 +117,16 @@ fn capture(wanted: &str) {
         pictures as f64 / seconds
     );
     println!("frames delivered by the window server: {}", capture.frames());
+
+    if sound.is_some() {
+        println!(
+            "sound: {buffers} buffers, {} ms of stereo, peak {peak:.3}",
+            samples / 2 * 1000 / 48_000
+        );
+        if samples == 0 {
+            println!("  nothing arrived — with `capturesAudio` on, that means silence, not a fault.");
+        }
+    }
     if let Some(trouble) = capture.trouble() {
         println!("trouble: {trouble}");
     }

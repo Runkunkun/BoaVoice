@@ -206,12 +206,24 @@ pub fn show(
                     )
                     .changed();
                 if settings.screen.with_audio {
-                    // Said here rather than only when a share fails: an operating system will not let
-                    // a program record its own output without help, and knowing that *before* the
-                    // meeting is worth a line of text.
-                    let (text, colour) = match crate::screen::find_loopback() {
-                        Ok(loopback) => (format!("sound will come from {}", loopback.label), theme::OK),
-                        Err(advice) => (advice, theme::WARN),
+                    // Said here rather than only when a share fails: most operating systems will not
+                    // let a program record their output without help, and knowing that *before* the
+                    // meeting is worth a line of text. macOS is the exception now — the capture itself
+                    // carries the sound — so it is not told to go and install anything.
+                    let (text, colour) = if cfg!(target_os = "macos") {
+                        (
+                            "the screen capture carries it — nothing to install, and this app's own \
+                             sound is left out so nobody hears themselves back"
+                                .to_string(),
+                            theme::OK,
+                        )
+                    } else {
+                        match crate::screen::find_loopback() {
+                            Ok(loopback) => {
+                                (format!("sound will come from {}", loopback.label), theme::OK)
+                            }
+                            Err(advice) => (advice, theme::WARN),
+                        }
                     };
                     ui.label(egui::RichText::new(text).size(10.0).color(colour));
                 }
