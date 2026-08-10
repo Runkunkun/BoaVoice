@@ -36,8 +36,10 @@ services:
 
     environment:
       BOA_NAME: "BoaVoice"
-      # Only the first account may register once this is set — the owner can then hand out accounts
-      # by creating them, and a box on the open internet is not a spam target.
+      # Only the first account may register once this is set. There is no administrator in this
+      # server, so this is the *only* control over who gets in: turn it off for as long as somebody
+      # needs to register, then turn it back on. A box on the open internet with it off is a spam
+      # target.
       # BOA_CLOSED_REGISTRATION: "1"
       #
       # Largest attachment, in megabytes. Attachments live on the server for three days; anything
