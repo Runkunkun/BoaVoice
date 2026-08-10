@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["crates/boa-proto", "crates/boa-server", "crates/boa-client"]
+
+# Versions live here rather than in three files that can drift apart. The client
+# and the server share the wire types, serde and tokio; a mismatch between them is
+# a protocol bug that would only show up at runtime.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+authors = ["BoaVoice contributors"]
+
+[workspace.dependencies]
+boa-proto = { path = "crates/boa-proto" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = [
+    "auto-color",
+    "humantime",
+] }
+anyhow = "1.0"
+thiserror = "2.0"
+rand = "0.9"
+chacha20poly1305 = "0.10"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "fs",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# The release profile the shipped binaries are built with. `lto = "thin"` rather
+# than "fat": the difference is not measurable in a workload dominated by audio
+# callbacks and socket syscalls, and fat LTO roughly triples link time on a
+# workspace this size.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Voice runs in debug builds too — the capture path has to keep up with a 10 ms
+# callback deadline, and unoptimised Opus plus RNNoise does not. These three are
+# the hot ones; everything else stays debuggable.
+[profile.dev.package.opus]
+opt-level = 3
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3

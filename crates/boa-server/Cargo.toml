@@ -1,0 +1,48 @@
+[package]
+name = "boa-server"
+description = "The self-hostable BoaVoice server: chat, attachments with a three-day life, and a voice/video relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "boa-server"
+path = "src/main.rs"
+
+[dependencies]
+boa-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+tokio.workspace = true
+
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# SQLite through rusqlite rather than sqlx: the whole database is one file on the
+# same machine, every query here is single-digit microseconds, and `bundled` means
+# the server builds and runs with no system SQLite to be the wrong version.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+argon2 = "0.5"
+sha2 = "0.10"
+
+# Only to read an uploaded image's dimensions, so the client can reserve the right
+# space in the chat log before the bytes arrive. Decoding is not wanted, and the
+# feature list is the formats the client draws inline.
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,56 @@
+# A BoaVoice server, ready to run.
+#
+#     docker compose up -d
+#
+# Then register the first account from a client — it becomes the owner and gets a #general and a
+# Lounge. To update:
+#
+#     docker compose pull && docker compose up -d
+#
+# The data directory survives that; the container does not have to.
+
+services:
+  boavoice:
+    image: ghcr.io/runkunkun/boavoice-server:latest
+    # Or build it from a checkout instead of pulling:
+    # build: .
+    container_name: boavoice
+    restart: unless-stopped
+
+    ports:
+      # Chat and control. Put a reverse proxy in front of this one if you want TLS.
+      - "8787:8787/tcp"
+      # Voice and screens. **This one is not optional and cannot go through a proxy.** A server with
+      # only the TCP port published is a server where chat works and nobody can hear anybody.
+      - "8788:8788/udp"
+
+    volumes:
+      # The SQLite database and the attachment blobs. Everything else in the container is disposable.
+      - ./data:/data
+
+    environment:
+      BOA_NAME: "BoaVoice"
+      # Only the first account may register once this is set — the owner can then hand out accounts
+      # by creating them, and a box on the open internet is not a spam target.
+      # BOA_CLOSED_REGISTRATION: "1"
+      #
+      # Largest attachment, in megabytes. Attachments live on the server for three days; anything
+      # genuinely large should go directly between the two clients, which has no limit at all.
+      BOA_MAX_UPLOAD_MB: "64"
+      #
+      # Your own relays for direct file transfers, if you run them. Without these, clients use the
+      # public magic-wormhole services — the files themselves still go peer to peer and encrypted.
+      # BOA_WORMHOLE_RENDEZVOUS: "ws://boa.example.com:4000/v1"
+      # BOA_WORMHOLE_TRANSIT: "tcp://boa.example.com:4001"
+      #
+      # `info` is quiet: a line per connection and a summary every five minutes. `debug` adds a line
+      # per dropped packet, which is a lot.
+      RUST_LOG: "info"
+
+    # The relay forwards a datagram per speaker per 20 ms, so it wants to be responsive rather than
+    # large. These are generous for a handful of people and keep a runaway from taking the host with
+    # it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M

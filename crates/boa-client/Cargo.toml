@@ -1,0 +1,89 @@
+[package]
+name = "boa-client"
+description = "The BoaVoice client: voice, screen sharing, chat and direct file transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "boavoice"
+path = "src/main.rs"
+
+[lib]
+name = "boa_client"
+path = "src/lib.rs"
+
+[dependencies]
+boa-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+tokio.workspace = true
+
+# --- UI -------------------------------------------------------------------
+# wgpu rather than glow: the glass look leans on large translucent fills that get
+# recomposited every frame, and a screen share is a full-window texture upload on
+# top of that.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+] }
+egui = "0.36.1"
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
+raw-window-handle = "0.6"
+dirs = "6.0"
+rfd = "0.15"
+sha2 = "0.10"
+
+# --- networking -----------------------------------------------------------
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# rustls rather than the platform's TLS: a self-hosted server is usually reached over
+# plain HTTP on a LAN, and when it is not, one TLS stack that behaves identically on
+# three platforms is worth more than integration with each platform's own.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "query",
+    "rustls",
+    "webpki-roots",
+] }
+
+# --- audio ----------------------------------------------------------------
+cpal = "0.18"
+opus = "0.3"
+nnnoiseless = "0.5"
+openh264 = "0.9"
+magic-wormhole = { version = "0.8", features = ["transfer"] }
+async-compat = "0.2.5"
+url = "2.5.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSAppearance",
+    "NSApplication",
+    "NSColor",
+    "NSGraphics",
+    "NSResponder",
+    "NSUserInterfaceItemIdentification",
+    "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+
+[dev-dependencies]
+tempfile = "3"

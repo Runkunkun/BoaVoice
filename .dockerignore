@@ -1,0 +1,19 @@
+# The build context is sent to the daemon before anything runs, and `target/` is several gigabytes of
+# artefacts that the image builds from scratch anyway. Without this line a `docker build` spends a
+# minute uploading things it will not use.
+target/
+dist/
+
+# The client's own resources. The image holds only the server.
+packaging/
+scripts/
+
+# Local state that must never end up in an image.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+.git/
+.github/
+.DS_Store

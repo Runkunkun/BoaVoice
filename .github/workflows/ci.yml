@@ -1,0 +1,86 @@
+# Build and test on the platforms the app ships for.
+#
+# macOS and Linux both run the full suite, because a good third of the tests are about things that
+# differ between them: socket error kinds, audio device enumeration, path handling. Windows builds but
+# does not run the audio-device tests under a headless runner, where there is no device to enumerate —
+# that is stated in the step rather than worked around, because a test that passes by being skipped is
+# worse than one that is honestly not run.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info is the bulk of the target directory and nothing here reads a backtrace from CI.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.name }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # ALSA for cpal, the xcb/xkb set for winit, nasm for OpenH264's assembly paths. Without the
+      # first one the client does not build at all; without the last it builds and is slower.
+      - name: system libraries (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            nasm
+
+      - name: build
+        run: cargo build --workspace --all-targets
+
+      - name: test
+        run: cargo test --workspace
+
+      # No `cargo fmt --check`. The code is laid out by hand at a wider width than rustfmt's
+      # default, as its sibling projects are, and a formatting gate would reflow it rather than tidy
+      # it. Clippy is the gate that catches things that are actually wrong.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The image is built on every push so a broken Dockerfile is found here rather than on the server
+  # somebody is trying to update. It is not pushed — that is release.yml's job.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build the server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: boavoice-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
