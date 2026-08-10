@@ -144,7 +144,7 @@ fn parse_screens(listing: &str) -> Vec<Source> {
 fn windows_windows() -> Vec<Source> {
     let script = "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | \
                   ForEach-Object { $_.MainWindowTitle }";
-    let Ok(out) = Command::new("powershell")
+    let Ok(out) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
