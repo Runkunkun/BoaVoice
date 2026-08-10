@@ -161,7 +161,7 @@ pub fn sources() -> Result<Vec<Source>, String> {
     }
     // Largest first: the window somebody means to share is almost always a big one, and the long tail
     // of small utility windows belongs at the bottom of the list.
-    windows.sort_by(|a, b| b.0.cmp(&a.0));
+    windows.sort_by_key(|(area, _)| std::cmp::Reverse(*area));
     found.extend(windows.into_iter().map(|(_, source)| source));
 
     Ok(found)
@@ -184,7 +184,7 @@ fn is_furniture(bundle: &str) -> bool {
         "com.apple.WindowServer",
         "com.apple.screencaptureui",
     ];
-    DESKTOP.iter().any(|known| bundle == *known)
+    DESKTOP.contains(&bundle)
 }
 
 /// What a [`Source`]'s `input` refers to.

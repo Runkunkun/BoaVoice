@@ -1049,7 +1049,6 @@ impl App {
                     return;
                 }
                 self.picking = Some(found);
-                return;
             }
 
             Action::ShareSource(source) => {

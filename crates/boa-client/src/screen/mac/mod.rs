@@ -16,3 +16,4 @@
 //! build requirement for anybody compiling this app.
 
 pub mod content;
+pub mod encode;
