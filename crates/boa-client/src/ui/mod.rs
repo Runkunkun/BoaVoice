@@ -1563,6 +1563,7 @@ fn watching(
         if let Some(watcher) = watcher {
             let frames = watcher.frames.load(Ordering::Relaxed);
             let dropped = watcher.dropped.load(Ordering::Relaxed);
+            let refused = watcher.failed.load(Ordering::Relaxed);
             // Whether the share *claims* sound is worth showing next to the frame count: a share
             // with no sound and a share whose sound is not arriving look identical otherwise.
             let sound = match state.voice.get(&user).and_then(|s| s.screen) {
@@ -1570,11 +1571,23 @@ fn watching(
                 Some(_) => " · no sound",
                 None => "",
             };
-            ui.label(
-                egui::RichText::new(format!("{frames} frames, {dropped} dropped{sound}"))
-                    .size(10.5)
-                    .color(theme::TEXT_FAINT),
-            );
+            // Loss as a share of what was attempted, because "412 dropped" means nothing without
+            // knowing whether 400 or 40,000 arrived — and this number is the one that says whether the
+            // picture is stuttering because of the link or because of the machine.
+            let attempted = frames + dropped;
+            let loss = dropped.checked_mul(100).and_then(|d| d.checked_div(attempted)).unwrap_or(0);
+            let colour = if loss > 20 { theme::WARN } else { theme::TEXT_FAINT };
+            let mut text = format!("{frames} frames");
+            if dropped > 0 {
+                text.push_str(&format!(", {loss}% lost"));
+            }
+            // Refusals are a different animal: they mean the bytes were wrong rather than missing, so
+            // they are named rather than folded into the loss figure.
+            if refused > 0 {
+                text.push_str(&format!(", {refused} refused"));
+            }
+            text.push_str(sound);
+            ui.label(egui::RichText::new(text).size(10.5).color(colour));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::icon_button(ui, icons::close, 26.0, "Stop watching").clicked() {

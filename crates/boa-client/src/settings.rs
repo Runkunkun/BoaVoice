@@ -120,8 +120,8 @@ pub struct ScreenSettings {
     /// Longest edge the picture may reach, in pixels.
     ///
     /// A *ceiling*, not a choice — and not shown in the settings screen. The share keeps its source's
-    /// own resolution; this only stops a 6K display being sent at a size no decoder will take. It
-    /// stays in the file so that somebody with a reason can lower it by hand.
+    /// own resolution up to this; it stays in the file so that somebody with a reason can change it by
+    /// hand, in either direction.
     pub max_dimension: u32,
     pub fps: u32,
     pub kbps: u32,
@@ -131,11 +131,17 @@ pub struct ScreenSettings {
 
 impl Default for ScreenSettings {
     fn default() -> Self {
-        // The source's own resolution up to 4K, 60 frames a second, 8 Mbit/s. The bitrate is the one
-        // number that is a real choice: it looks good on a LAN and does not saturate a typical home
-        // uplink, and the settings screen goes considerably further in both directions with nothing on
-        // the server objecting.
-        ScreenSettings { max_dimension: 3_840, fps: 60, kbps: 8_000, with_audio: true }
+        // 1080p, 30 frames a second, 6 Mbit/s — and every one of those is a *default* rather than a
+        // limit: the settings screen and this file go to 8K, 240 fps and 200 Mbit/s, and nothing on the
+        // server has an opinion about any of it.
+        //
+        // The reason to start here rather than at 4K60 is the other end. Watchers decode in software,
+        // and a 4K60 stream costs several times more to decode than to encode — the sender's hardware
+        // encoder makes it look free while everybody watching drops frames. 4K keyframes are also close
+        // to a megabyte each, and a megabyte arriving in one frame interval is a burst most home links
+        // simply discard. Somebody on a LAN who wants 4K60 can have it in two clicks; somebody who never
+        // opens the settings gets a share that works.
+        ScreenSettings { max_dimension: 1_920, fps: 30, kbps: 6_000, with_audio: true }
     }
 }
 
@@ -305,7 +311,8 @@ mod tests {
         assert_eq!(settings.server_url, "host");
         assert!(settings.voice.noise_suppression, "the default, not false");
         assert_eq!(settings.voice.jitter_ms, 60);
-        assert_eq!(settings.screen.fps, 60);
+        assert_eq!(settings.screen.fps, 30);
+        assert_eq!(settings.screen.max_dimension, 1_920);
 
         // And an entirely empty object is valid.
         let settings: Settings = serde_json::from_str("{}").unwrap();

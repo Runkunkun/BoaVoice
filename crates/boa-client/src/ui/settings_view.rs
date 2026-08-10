@@ -237,6 +237,17 @@ pub fn show(
                     .size(10.0)
                     .color(theme::ACCENT_DEEP),
                 );
+                // The number people get wrong, because home connections are sold on their download
+                // speed. A share is *upload*, sustained, for as long as it lasts.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} Mbit/s of video needs that much upload, continuously — and watchers decode \
+                         in software, so a 4K60 stream can cost them more than it costs you to send.",
+                        settings.screen.kbps as f32 / 1000.0
+                    ))
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+                );
 
                 ui.add_space(12.0);
                 glass::fill_card(ui, slot, card_rect(ui, width, top));
