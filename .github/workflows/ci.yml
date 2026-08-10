@@ -95,30 +95,47 @@ jobs:
           set -o pipefail
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
 
+      # A failure here has to explain itself in the annotations, because the log itself needs admin
+      # rights to read through the API — the wrong way round when the point of CI is to say what
+      # broke. The first attempt at this looked for compiler diagnostics and found none, which was
+      # itself the useful finding: the failure is not rustc. So this prints the tail of whatever
+      # happened, verbatim.
       - name: what went wrong
         if: failure()
         run: |
+          ls -la ./*.log || echo "no logs were written at all"
+          df -h . | tail -2 || true
           python3 - <<'PY'
-          import glob, re
-          # One annotation per compiler diagnostic, capped: a broken build can produce hundreds and the
-          # first few are the ones that explain it.
-          shown = 0
-          for name in ("build.log", "test.log", "clippy.log"):
-              for path in glob.glob(name):
-                  with open(path, encoding="utf-8", errors="replace") as handle:
-                      text = handle.read()
-                  for block in re.split(r"\n(?=error|warning: unused|warning: unreach)", text):
-                      if not block.startswith("error") and "-D warnings" not in block:
-                          continue
-                      if shown >= 12:
-                          break
-                      shown += 1
-                      # Annotations are one line, so newlines become a separator GitHub keeps.
-                      flat = block.strip().replace("%", "%25").replace("\r", "")
-                      flat = flat.replace("\n", "%0A")[:3000]
-                      print(f"::error title={path}::{flat}")
-          if shown == 0:
-              print("::error::the step failed without a recognisable compiler diagnostic — see the log")
+          import glob, os
+
+          def annotate(title, text):
+              flat = text.replace("%", "%25").replace("\r", "")
+              flat = flat.replace("\n", "%0A")[:4000]
+              print(f"::error title={title}::{flat}")
+
+          found = False
+          for path in ("build.log", "test.log", "clippy.log"):
+              if not os.path.exists(path):
+                  continue
+              found = True
+              with open(path, encoding="utf-8", errors="replace") as handle:
+                  lines = handle.read().splitlines()
+              # The tail, which for a build script or a linker failure is where the reason is.
+              annotate(f"{path} (last 60 lines)", "\n".join(lines[-60:]))
+              # And any line that looks like a diagnosis, wherever it is.
+              interesting = [
+                  line for line in lines
+                  if line.startswith("error")
+                  or "failed to run custom build command" in line
+                  or "linking with" in line
+                  or "No space left" in line
+                  or "signal:" in line
+                  or "not found" in line
+              ]
+              if interesting:
+                  annotate(f"{path} (diagnoses)", "\n".join(interesting[:40]))
+          if not found:
+              annotate("no log", "the step failed before writing a log — see the run's own output")
           PY
 
   # The image is built on every push so a broken Dockerfile is found here rather than on the server
