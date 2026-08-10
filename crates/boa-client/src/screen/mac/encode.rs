@@ -33,6 +33,7 @@ use objc2_core_media::{
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
+    kVTCompressionPropertyKey_DataRateLimits,
     kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
@@ -165,6 +166,28 @@ impl Encoder {
             // expected — which on a static screen it will.
             self.set(kVTCompressionPropertyKey_MaxKeyFrameInterval, number_i32(fps * 2));
             self.set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, number_f64(2.0));
+            // **A ceiling as well as an average.** `AverageBitRate` is exactly that — an average — and
+            // says nothing about any given second. The limit is a pair, bytes and the seconds they are
+            // measured over, so this one says "no more than one and a half times the budget in any one
+            // second".
+            //
+            // Worth being precise about what this does *not* do. It does not shrink a keyframe: measured
+            // at 1080p and 16 Mbit/s, one came to 416 KB, and a 3 MB-per-second allowance does not
+            // constrain that at all. Tightening the window until it did would mean butchering the
+            // keyframe, which is the picture everybody's stream is rebuilt from. The burst is the
+            // *sender's* problem to solve, and the pacer in `screen::send` solves it by spreading those
+            // 416 KB over about seventy milliseconds. What this limit catches is the other case: a
+            // permanently busy screen where the encoder would otherwise sit above budget indefinitely.
+            if let Some(limits) = data_rate_limits(kbps) {
+                let status = objc2_video_toolbox::VTSessionSetProperty(
+                    &self.session as &objc2_video_toolbox::VTSession,
+                    kVTCompressionPropertyKey_DataRateLimits,
+                    Some(&limits),
+                );
+                if status != 0 {
+                    log::debug!("screen: encoder declined a data rate limit (status {status})");
+                }
+            }
         }
         Ok(())
     }
@@ -408,6 +431,32 @@ fn parameter_sets(sample: &CMSampleBuffer) -> Vec<Vec<u8>> {
 // --------------------------------------------------------------------------- //
 // Core Foundation odds and ends
 // --------------------------------------------------------------------------- //
+
+/// The `DataRateLimits` pair: how many bytes, over how many seconds.
+///
+/// A two-element `CFArray` of `[bytes, seconds]`, which is the shape VideoToolbox documents — and it has
+/// to be built by hand because the bindings have no helper for an array of mixed numbers.
+fn data_rate_limits(kbps: u32) -> Option<CFRetained<CFType>> {
+    let bytes = (kbps as f64 * 1.5 * 1_000.0 / 8.0) as i32;
+    let cap = number_i32(bytes)?;
+    let window = number_f64(1.0)?;
+
+    let mut values: Vec<*const c_void> = vec![
+        CFRetained::as_ptr(&cap).as_ptr() as *const c_void,
+        CFRetained::as_ptr(&window).as_ptr() as *const c_void,
+    ];
+    // SAFETY: two live Core Foundation numbers, and the array retains what it is given — `cap` and
+    // `window` outlive the call.
+    let array = unsafe {
+        objc2_core_foundation::CFArray::new(
+            None,
+            values.as_mut_ptr(),
+            2,
+            std::ptr::null(),
+        )
+    }?;
+    Some(array.into())
+}
 
 fn boolean(value: bool) -> Option<CFRetained<CFType>> {
     // SAFETY: the two constants are framework statics.

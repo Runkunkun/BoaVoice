@@ -322,6 +322,7 @@ fn native(
     ssrc: u32,
     for_audio: Option<Transport>,
 ) -> Result<Started> {
+    let kbps = settings.kbps;
     let want_sound = settings.with_audio && for_audio.is_some();
     let mut capture = super::mac::capture::Capture::start(
         target,
@@ -354,7 +355,7 @@ fn native(
 
     let thread = std::thread::Builder::new()
         .name("boa-screen-tx".into())
-        .spawn(move || pump_pictures(pictures, wiring))
+        .spawn(move || pump_pictures(pictures, wiring, kbps))
         .context("spawning the screen sender")?;
 
     Ok(Started { engine: Engine::Native(capture), thread, width, height, audio, audio_problem })
@@ -404,10 +405,11 @@ fn spawn_ffmpeg(
         });
     }
 
+    let kbps = settings.kbps;
     let thread = std::thread::Builder::new()
         .name("boa-screen-tx".into())
         .spawn(move || {
-            if let Err(err) = pump(stdout, wiring) {
+            if let Err(err) = pump(stdout, wiring, kbps) {
                 log::error!("screen: {err:#}");
                 crate::diagnostics::note(&format!("screen: send stopped: {err:#}"));
             }
@@ -631,23 +633,83 @@ fn encoder() -> &'static str {
 /// One picture at a time, onto the wire and into the preview.
 ///
 /// The part both engines share — and the reason it is a type rather than a function is the sequence
-/// number and the two scratch buffers, which have to live across pictures.
+/// number, the two scratch buffers and the pacer, all of which have to live across pictures.
 struct Wire {
     wiring: Wiring,
     payload: Vec<u8>,
     scratch: Vec<u8>,
     seq: u32,
     start: Instant,
+    /// Spreads a picture's datagrams out. See [`Pacer`].
+    pacer: Pacer,
+}
+
+/// Holds datagrams back to a byte rate, so a picture leaves as a stream rather than a burst.
+///
+/// **Why a screen share needs this and voice does not.** Voice is one small datagram every 20 ms. A
+/// keyframe is *hundreds* of datagrams produced in one go — measured at 353 for a 1080p screen — and
+/// handed to the socket as fast as the loop can write them, which is a burst of several gigabits per
+/// second. Every buffer on the path is smaller than that: the sender's own, the relay's receive queue,
+/// the switch's egress queue, the far side's receive buffer. Whichever fills first discards the rest of
+/// the picture, and a keyframe missing one fragment is a keyframe the watcher cannot use — so the stream
+/// stays broken until the next one, which arrives the same way and breaks the same way.
+///
+/// Spreading the same bytes over a few tens of milliseconds costs nothing anybody can see and turns a
+/// burst that no queue can hold into a stream that any of them can.
+struct Pacer {
+    /// The earliest the next datagram may go out.
+    next: Instant,
+    /// Nanoseconds per byte at the ceiling.
+    per_byte: u32,
+}
+
+impl Pacer {
+    /// A pacer for a share configured at `kbps`.
+    fn new(kbps: u32) -> Pacer {
+        Pacer { next: Instant::now(), per_byte: Pacer::per_byte(kbps) }
+    }
+
+    /// Nanoseconds per byte: three times the configured bitrate, with a floor.
+    ///
+    /// Three times, because a keyframe legitimately *is* several times an average frame and holding it
+    /// to the average would delay it by frames rather than milliseconds. The floor keeps a deliberately
+    /// tiny share from pacing itself into treacle.
+    fn per_byte(kbps: u32) -> u32 {
+        let ceiling_bits = (kbps as u64 * 3 * 1_000).max(6_000_000);
+        (8_000_000_000u64 / ceiling_bits).max(1) as u32
+    }
+
+    /// Wait, if this datagram is ahead of schedule, then charge it to the budget.
+    fn take(&mut self, bytes: usize) {
+        let now = Instant::now();
+        if self.next > now {
+            let wait = self.next - now;
+            // Under a hundred microseconds is not worth a syscall, and `sleep` cannot deliver it
+            // anyway: the granularity is closer to a millisecond, so a request for 50 µs costs a
+            // millisecond of frame time. Skipping the wait is what keeps this a smoother rather than a
+            // stutterer.
+            if wait > std::time::Duration::from_micros(100) {
+                std::thread::sleep(wait);
+            }
+        } else {
+            // Behind schedule — usually because nothing was sent for a while. Start again from now
+            // rather than accumulating credit, which would let the next picture burst freely and defeat
+            // the whole arrangement.
+            self.next = now;
+        }
+        self.next += std::time::Duration::from_nanos(self.per_byte as u64 * bytes as u64);
+    }
 }
 
 impl Wire {
-    fn new(wiring: Wiring) -> Wire {
+    fn new(wiring: Wiring, kbps: u32) -> Wire {
         Wire {
             wiring,
             payload: Vec::with_capacity(1_200),
             scratch: Vec::with_capacity(1_200),
             seq: 0,
             start: Instant::now(),
+            pacer: Pacer::new(kbps),
         }
     }
 
@@ -668,6 +730,7 @@ impl Wire {
 
         for (index, count, chunk) in fragment(&picture.data) {
             write_fragment(index, count, chunk, &mut self.payload);
+            self.pacer.take(self.payload.len() + boa_proto::media::HEADER_LEN + 16);
             self.seq = self.seq.wrapping_add(1);
             let header = PacketHeader { kind, ssrc: self.wiring.ssrc, seq: self.seq, timestamp };
             match self.wiring.transport.send(header, &self.payload, &mut self.scratch) {
@@ -687,10 +750,10 @@ impl Wire {
 }
 
 /// Read ffmpeg's output and put it on the wire.
-fn pump(mut stdout: std::process::ChildStdout, wiring: Wiring) -> Result<()> {
+fn pump(mut stdout: std::process::ChildStdout, wiring: Wiring, kbps: u32) -> Result<()> {
     let mut reader = Annexb::default();
     let mut buffer = vec![0u8; 64 * 1024];
-    let mut wire = Wire::new(wiring);
+    let mut wire = Wire::new(wiring, kbps);
 
     while !wire.stopped() {
         let read = stdout.read(&mut buffer).context("reading from ffmpeg")?;
@@ -711,10 +774,14 @@ fn pump(mut stdout: std::process::ChildStdout, wiring: Wiring) -> Result<()> {
 /// it stays still, and this thread should be asleep for that whole time rather than waking up sixty times
 /// a second to find nothing. The timeout is what lets it notice that the share has been stopped.
 #[cfg(target_os = "macos")]
-fn pump_pictures(pictures: std::sync::mpsc::Receiver<super::mac::encode::Picture>, wiring: Wiring) {
+fn pump_pictures(
+    pictures: std::sync::mpsc::Receiver<super::mac::encode::Picture>,
+    wiring: Wiring,
+    kbps: u32,
+) {
     use std::sync::mpsc::RecvTimeoutError;
 
-    let mut wire = Wire::new(wiring);
+    let mut wire = Wire::new(wiring, kbps);
     while !wire.stopped() {
         match pictures.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(picture) => {
@@ -867,6 +934,55 @@ fn nal_type(nal: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pacer's arithmetic, which decides whether a keyframe leaves as a stream or as a burst.
+    #[test]
+    fn the_pacer_spreads_a_keyframe_without_holding_it_back() {
+        // 16 Mbit/s configured — the settings this was found with — paced at three times that.
+        let per_byte = Pacer::per_byte(16_000);
+        let keyframe_bytes = 353 * 1_216;
+        let spread = std::time::Duration::from_nanos(per_byte as u64 * keyframe_bytes as u64);
+
+        // Long enough to stop being a burst: without pacing those datagrams leave in under a
+        // millisecond, which is gigabits per second instantaneously and more than any queue on the path
+        // will hold.
+        assert!(spread.as_millis() >= 30, "not spread at all: {spread:?}");
+        // Short enough not to be noticed: a keyframe held back by a quarter of a second would be a
+        // visible stall every two seconds, which is a worse fault than the one being fixed.
+        assert!(spread.as_millis() <= 250, "held back too long: {spread:?}");
+
+        // A smaller share is paced more slowly per byte — that is the whole point — but only down to the
+        // floor. At the minimum bitrate the ceiling is 6 Mbit/s, so even there a 30 KB keyframe leaves
+        // within about 40 ms rather than being drip-fed for half a second.
+        assert!(Pacer::per_byte(200) > Pacer::per_byte(16_000), "a small share should pace more slowly");
+        let small_keyframe = std::time::Duration::from_nanos(Pacer::per_byte(200) as u64 * 30_000);
+        assert!(small_keyframe.as_millis() <= 60, "the floor is too low: {small_keyframe:?}");
+        // And a very large one is never paced below one nanosecond per byte, which would be a division
+        // by zero waiting to happen.
+        assert!(Pacer::per_byte(200_000) >= 1);
+    }
+
+    /// Credit must not accumulate while nothing is being sent, or the pacer waves through exactly the
+    /// burst it exists to prevent — a still screen followed by a keyframe is the common case.
+    #[test]
+    fn an_idle_pacer_does_not_bank_credit() {
+        let mut pacer = Pacer::new(2_000);
+        pacer.take(1_200);
+        // Pretend a second went by with nothing sent.
+        pacer.next = Instant::now() - std::time::Duration::from_secs(1);
+
+        let started = Instant::now();
+        for _ in 0..40 {
+            pacer.take(1_200);
+        }
+        // 48 KB at the floor of 6 Mbit/s is about 64 ms. Allowing anything from a third of that upwards
+        // keeps the test about the *absence of banked credit* rather than about sleep precision.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(20),
+            "the burst went straight through: {:?}",
+            started.elapsed()
+        );
+    }
 
     /// Build an Annex-B stream from (type, payload) pairs, alternating start-code lengths so both
     /// are exercised.
