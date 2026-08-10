@@ -18,9 +18,20 @@
 //! only ever watches needs nothing but the app.
 //!
 //! **Desktop audio** travels beside the picture as a second stream — stereo Opus, on the same stream
-//! id and the same socket. It needs a loopback device on macOS and Windows and nothing at all on
-//! Linux; [`audio`] explains why, and says what to install when there is nothing. A machine without
-//! one still shares its screen, silently, with the reason in the interface rather than in a log.
+//! id and the same socket. It is captured by recording a *device*: a PulseAudio monitor source on
+//! Linux (nothing to install), or a loopback device on macOS and Windows. [`audio`] explains what and
+//! why, and says what to install when there is nothing to record.
+//!
+//! **The better way on macOS, not done yet.** ScreenCaptureKit can hand over the machine's own output
+//! directly, with no loopback device, under the same screen-recording permission a share already
+//! needs — which is how Discord does it. It is not used here yet for one practical reason: the
+//! ergonomic Rust wrapper for it builds Swift helper libraries and therefore needs a full Xcode
+//! install, which is a heavy thing to require of anyone building this. Doing it through the raw
+//! `objc2` bindings avoids that and is the intended route; it is a hand-written delegate class,
+//! completion blocks and CoreMedia buffer handling, and it is the next piece of work here.
+//!
+//! A machine that can do neither still shares its screen, silently, with the reason in the interface
+//! rather than in a log.
 
 pub mod audio;
 pub mod recv;
