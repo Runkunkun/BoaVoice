@@ -583,6 +583,75 @@ mod tests {
         assert!(width <= crate::screen::MAX_DIMENSION, "{width}");
     }
 
+    /// **The interop check that matters.** VideoToolbox encodes High profile; the watchers decode with
+    /// openh264, in-process. If those two do not agree, every share in this app is a black rectangle on
+    /// everybody else's machine — and nothing else in the test suite would notice, because both halves
+    /// work perfectly on their own.
+    ///
+    /// So: capture the real screen, encode with the real hardware, and decode with the real decoder the
+    /// receiving side uses.
+    #[test]
+    fn what_this_encodes_is_what_the_watchers_can_decode() {
+        let Ok(sources) = content::sources() else { return };
+        let Some(screen) = sources.iter().find(|source| !source.window) else { return };
+        let target = content::target(screen).expect("a screen source is addressable");
+
+        let capture = match Capture::start(target, 960, 540, 30, 1_500, false) {
+            Ok(capture) => capture,
+            Err(err) => {
+                eprintln!("no capture here: {err:#}");
+                return;
+            }
+        };
+
+        let mut decoder = match openh264::decoder::Decoder::new() {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                eprintln!("no decoder here: {err}");
+                return;
+            }
+        };
+
+        // A keyframe first — a delta picture decoded without its reference is noise — then a few more,
+        // because a decoder that manages the keyframe and chokes on the deltas is the subtler failure.
+        let mut seen_keyframe = false;
+        let mut decoded = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while decoded < 4 && std::time::Instant::now() < deadline {
+            let Some(picture) = capture.take() else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            };
+            seen_keyframe |= picture.keyframe;
+            if !seen_keyframe {
+                continue;
+            }
+            match decoder.decode(&picture.data) {
+                // A picture that produced nothing is normal — the decoder holds one back.
+                Ok(None) => {}
+                Ok(Some(frame)) => {
+                    use openh264::formats::YUVSource as _;
+                    let (width, height) = frame.dimensions();
+                    assert_eq!(
+                        (width as u32, height as u32),
+                        (capture.width, capture.height),
+                        "the decoder disagrees with the encoder about the size"
+                    );
+                    decoded += 1;
+                }
+                Err(err) => panic!(
+                    "openh264 could not decode what VideoToolbox produced: {err} \
+                     (keyframe: {}, {} bytes)",
+                    picture.keyframe,
+                    picture.data.len()
+                ),
+            }
+        }
+
+        assert!(seen_keyframe, "no keyframe within five seconds");
+        assert!(decoded >= 1, "nothing decoded — a share would be a black rectangle");
+    }
+
     /// The real thing, end to end: the main screen, captured, encoded, and a keyframe out the other
     /// side. Skipped rather than failed where screen recording is not granted, because that is a
     /// property of the machine and not of the code.
