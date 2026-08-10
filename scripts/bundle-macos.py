@@ -16,9 +16,10 @@ For a voice app, three keys in there are doing work that nothing else can do:
 * `LSMinimumSystemVersion` — the vibrancy material the window relies on is a 10.14 API, and
   below that the app would run with a plain dark background.
 
-Screen recording needs no key. It is granted by the user in System Settings the first time
-something asks, and what asks here is `ffmpeg` — so the permission lands on whichever
-process launched it, which is this bundle. There is no plist entry that pre-authorises it.
+Screen recording needs no key. There is no plist entry that pre-authorises it: the app asks
+for it directly (`CGRequestScreenCaptureAccess`), macOS shows its prompt, and the answer is
+remembered against *this bundle's* signature. Which is why a rebuilt bundle can find itself
+asking again, and why the permission granted to a terminal does not carry over to the app.
 
 Usage:
     cargo build --release

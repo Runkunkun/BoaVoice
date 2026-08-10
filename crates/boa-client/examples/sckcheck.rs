@@ -1,6 +1,8 @@
-//! `cargo run --example sckcheck`
+//! `cargo run --example sckcheck [display:3 | window:1234]`
 //!
-//! Lists what ScreenCaptureKit says can be shared: the screens, and the windows.
+//! Lists what ScreenCaptureKit says can be shared: the screens, and the windows. Given one of those
+//! names, it then captures it for three seconds and reports what came out of the encoder — which is the
+//! whole sending path except for the socket.
 //!
 //! Worth having separately from the app because it answers the question the app cannot ask on somebody
 //! else's behalf: whether the screen-recording permission is granted *to this binary*. macOS grants it
@@ -45,7 +47,68 @@ fn main() {
             }
             Err(why) => println!("\nnothing to share: {why}"),
         }
+
+        // With a source named on the command line, capture it. Nothing goes on a wire: this is the
+        // encoder's output measured where the sender would pick it up.
+        if let Some(wanted) = std::env::args().nth(1) {
+            capture(&wanted);
+        } else {
+            println!();
+            println!("Pass one of those names to capture it for three seconds.");
+        }
     }
     #[cfg(not(target_os = "macos"))]
     println!("ScreenCaptureKit is a macOS framework; this platform uses ffmpeg.");
+}
+
+#[cfg(target_os = "macos")]
+fn capture(wanted: &str) {
+    use std::time::{Duration, Instant};
+
+    use boa_client::screen::mac::capture::Capture;
+    use boa_client::screen::mac::content;
+    use boa_client::screen::Source;
+
+    let source = Source { input: wanted.to_string(), label: wanted.to_string(), window: false };
+    let Some(target) = content::target(&source) else {
+        println!("\n{wanted:?} is not a source name — try display:1 or window:1234");
+        return;
+    };
+
+    println!();
+    let capture = match Capture::start(target, 1920, 1080, 30, 4_000) {
+        Ok(capture) => capture,
+        Err(err) => {
+            println!("could not capture: {err:#}");
+            return;
+        }
+    };
+    println!("capturing at {}×{} for three seconds…", capture.width, capture.height);
+
+    let (mut pictures, mut keyframes, mut bytes) = (0u64, 0u64, 0usize);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match capture.take() {
+            Some(picture) => {
+                pictures += 1;
+                keyframes += u64::from(picture.keyframe);
+                bytes += picture.data.len();
+            }
+            None => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+
+    let seconds = start.elapsed().as_secs_f64();
+    println!(
+        "{pictures} pictures ({keyframes} keyframes), {:.0} kbit/s, {:.1} fps",
+        (bytes as f64 * 8.0 / 1000.0) / seconds,
+        pictures as f64 / seconds
+    );
+    println!("frames delivered by the window server: {}", capture.frames());
+    if let Some(trouble) = capture.trouble() {
+        println!("trouble: {trouble}");
+    }
+    if pictures == 0 {
+        println!("nothing came out — with the permission granted, this is worth a bug report.");
+    }
 }

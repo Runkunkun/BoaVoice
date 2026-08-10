@@ -15,5 +15,6 @@
 //! for ScreenCaptureKit: that one builds Swift helper libraries, which makes a full Xcode install a
 //! build requirement for anybody compiling this app.
 
+pub mod capture;
 pub mod content;
 pub mod encode;

@@ -65,7 +65,9 @@ pub struct Encoder {
     /// The boxed [`Sink`] the callback holds a pointer to. Freed after the session is invalidated,
     /// never before: an in-flight callback would otherwise write into freed memory.
     sink: *mut Sink,
-    pictures: Receiver<Picture>,
+    /// Where finished pictures wait, when this encoder keeps them itself. `None` when the caller gave
+    /// it somewhere else to put them — see [`Encoder::sending_to`].
+    pictures: Option<Receiver<Picture>>,
     /// Frame index, which becomes the presentation timestamp. VideoToolbox needs timestamps to be
     /// increasing and otherwise does not care what they mean.
     frame: i64,
@@ -73,13 +75,32 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Start an encoder for a picture of this size.
+    /// Start an encoder for a picture of this size, keeping its output for [`Encoder::take`].
     pub fn new(width: i32, height: i32, fps: u32, kbps: u32) -> Result<Encoder> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
+        let mut encoder = Encoder::sending_to(width, height, fps, kbps, tx)?;
+        encoder.pictures = Some(rx);
+        Ok(encoder)
+    }
+
+    /// Start an encoder that puts every finished picture straight into `pictures`.
+    ///
+    /// This is the form the capture side uses, and the reason it exists is *latency*: the encoder's
+    /// callback runs on VideoToolbox's own thread, so a picture handed directly to the consumer is
+    /// available the moment it is ready. Draining it from the capture callback instead would leave the
+    /// last picture of a burst sitting in a queue until the screen next changed — which on a still
+    /// screen can be a long time.
+    pub fn sending_to(
+        width: i32,
+        height: i32,
+        fps: u32,
+        kbps: u32,
+        pictures: SyncSender<Picture>,
+    ) -> Result<Encoder> {
         if width <= 0 || height <= 0 {
             bail!("a {width}×{height} encoder is not a thing");
         }
-        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
-        let sink = Box::into_raw(Box::new(Sink { pictures: tx }));
+        let sink = Box::into_raw(Box::new(Sink { pictures }));
 
         let mut out: *mut VTCompressionSession = std::ptr::null_mut();
         // `avc1` — H.264. The specification dictionary asks for hardware, which on every Mac this runs
@@ -113,7 +134,7 @@ impl Encoder {
         // SAFETY: `create` returned a retained session.
         let session = unsafe { CFRetained::from_raw(NonNull::new_unchecked(out)) };
 
-        let encoder = Encoder { session, sink, pictures: rx, frame: 0, fps: fps.max(1) };
+        let encoder = Encoder { session, sink, pictures: None, frame: 0, fps: fps.max(1) };
         encoder.configure(kbps)?;
         log::info!("screen: VideoToolbox encoder {width}×{height} at {fps} fps, {kbps} kbit/s");
         Ok(encoder)
@@ -213,9 +234,9 @@ impl Encoder {
         Ok(())
     }
 
-    /// The next encoded picture, if one is ready.
+    /// The next encoded picture, if one is ready and this encoder is keeping them.
     pub fn take(&self) -> Option<Picture> {
-        self.pictures.try_recv().ok()
+        self.pictures.as_ref()?.try_recv().ok()
     }
 }
 

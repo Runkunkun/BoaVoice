@@ -22,6 +22,10 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
+use objc2_core_foundation::CGPoint;
+use objc2_core_graphics::{
+    CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayMode, CGError, CGGetDisplaysWithPoint, CGMainDisplayID,
+};
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{SCDisplay, SCShareableContent, SCWindow};
 
@@ -196,6 +200,108 @@ fn is_furniture(bundle: &str) -> bool {
 pub enum Target {
     Display(u32),
     Window(u32),
+}
+
+/// A target as the framework object needed to capture it, and how big it really is.
+pub enum Located {
+    Display(Retained<SCDisplay>),
+    Window(Retained<SCWindow>),
+}
+
+/// Find a target in the *current* shareable content.
+///
+/// Looked up again rather than held from the picker, because between choosing a window and pressing
+/// share it may have been closed — and a stale `SCWindow` produces a stream that starts and delivers
+/// nothing, which is the worst of the failure modes because it looks like it worked.
+pub fn locate(target: Target) -> Result<Located, String> {
+    let content = shareable()?;
+    match target {
+        Target::Display(id) => content
+            .displays
+            .iter()
+            // SAFETY: a property read on a framework object.
+            .find(|display| unsafe { display.displayID() } == id)
+            .map(Located::Display)
+            .ok_or_else(|| format!("screen {id} is no longer there")),
+        Target::Window(id) => content
+            .windows
+            .iter()
+            // SAFETY: as above.
+            .find(|window| unsafe { window.windowID() } == id)
+            .map(Located::Window)
+            .ok_or_else(|| "that window has been closed".to_string()),
+    }
+}
+
+impl Located {
+    /// The size to capture at, in **pixels**.
+    ///
+    /// ScreenCaptureKit reports sizes in *points*, and a stream configured with those numbers captures
+    /// a Retina screen at half its resolution — a picture that is not broken, just soft, which is the
+    /// sort of wrong that gets shipped. The backing scale is not on the framework object either, so it
+    /// comes from the display mode: pixel width over point width.
+    pub fn pixels(&self) -> (u32, u32) {
+        match self {
+            // SAFETY: property reads on a framework object.
+            Located::Display(display) => unsafe {
+                let scale = scale(display.displayID());
+                let (width, height) = (display.width() as f64, display.height() as f64);
+                ((width * scale) as u32, (height * scale) as u32)
+            },
+            // SAFETY: as above.
+            Located::Window(window) => unsafe {
+                let frame = window.frame();
+                // Which display the window is on decides its scale: a window dragged onto a
+                // non-Retina second monitor is captured at 1×, and asking for 2× would be upscaling
+                // blur at twice the bitrate.
+                let scale = scale(display_at(CGPoint {
+                    x: frame.origin.x + frame.size.width / 2.0,
+                    y: frame.origin.y + frame.size.height / 2.0,
+                }));
+                ((frame.size.width * scale) as u32, (frame.size.height * scale) as u32)
+            },
+        }
+    }
+
+    /// What to call this in a log line.
+    pub fn label(&self) -> String {
+        match self {
+            // SAFETY: property reads on a framework object.
+            Located::Display(display) => format!("display {}", unsafe { display.displayID() }),
+            Located::Window(window) => unsafe {
+                window.title().map(|title| title.to_string()).unwrap_or_else(|| "a window".into())
+            },
+        }
+    }
+}
+
+/// A display's backing scale — 2.0 on Retina, 1.0 on everything else.
+fn scale(display: CGDirectDisplayID) -> f64 {
+    let Some(mode) = CGDisplayCopyDisplayMode(display) else { return 1.0 };
+    let points = CGDisplayMode::width(Some(&mode)) as f64;
+    let pixels = CGDisplayMode::pixel_width(Some(&mode)) as f64;
+    if points > 0.0 && pixels > 0.0 {
+        // Clamped because a bad answer here is a stream at the wrong size: a zero would divide the
+        // picture away and a huge one would ask the encoder for something it will refuse.
+        (pixels / points).clamp(1.0, 3.0)
+    } else {
+        1.0
+    }
+}
+
+/// Which display a point is on, falling back to the main one.
+fn display_at(point: CGPoint) -> CGDirectDisplayID {
+    let mut displays: [CGDirectDisplayID; 1] = [0];
+    let mut count: u32 = 0;
+    // SAFETY: the array holds one id and `max_displays` says so; both out-pointers are stack slots.
+    unsafe {
+        let status = CGGetDisplaysWithPoint(point, 1, displays.as_mut_ptr(), &mut count);
+        if status == CGError::Success && count > 0 {
+            displays[0]
+        } else {
+            CGMainDisplayID()
+        }
+    }
 }
 
 /// Read a target back out of a source.

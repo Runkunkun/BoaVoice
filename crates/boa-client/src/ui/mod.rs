@@ -656,15 +656,32 @@ impl App {
 
     /// Notice a share that is running but producing nothing.
     ///
-    /// The failure this catches is the common one on macOS: ffmpeg starts, the screen-recording
-    /// permission has not been granted, and it exits or produces no frames. From the outside that is
-    /// a share everybody sees as active and nobody can see anything in — worse than no share at all,
-    /// because the person sharing has no reason to suspect it.
+    /// The failure this catches is the common one on macOS: the capture starts, the screen-recording
+    /// permission has not been granted, and nothing comes out. From the outside that is a share
+    /// everybody sees as active and nobody can see anything in — worse than no share at all, because
+    /// the person sharing has no reason to suspect it.
     fn check_share(&mut self) {
         let Some(share) = self.share.as_ref() else { return };
-        // A static screen still produces frames: H.264 sends a keyframe every couple of seconds, and
-        // the encoder emits something for every capture tick. Nothing at all after four seconds means
-        // nothing is being captured.
+
+        // The platform saying why beats anything guessed from a frame count, and it arrives whether or
+        // not frames were flowing before — a window that gets closed mid-share ends up here.
+        if let Some(trouble) = share.trouble() {
+            self.share = None;
+            self.preview = None;
+            self.net.send_msg(ClientMsg::StopScreen);
+            self.notify(Notice::error(format!("the screen share stopped: {trouble}")));
+            return;
+        }
+        // Only for ffmpeg, and that is a correctness point rather than a shortcut. ScreenCaptureKit
+        // delivers a frame when the screen *changes*, so a share of a genuinely still window produces
+        // nothing for as long as it stays still — and it reports refusals as errors at start-up
+        // instead, which is a better signal than a frame count. Guessing here would end somebody's
+        // share because they stopped moving.
+        if share.native() {
+            return;
+        }
+        // ffmpeg, on the other hand, encodes on a clock: a static screen still produces frames, so
+        // nothing at all after four seconds means nothing is being captured.
         if share.started.elapsed() < Duration::from_secs(4) {
             return;
         }
@@ -1512,6 +1529,22 @@ fn watching(
             line(36.0, format!("sound from {device}"), theme::TEXT_FAINT, 10.5);
         } else if let Some(problem) = &share.audio_problem {
             line(36.0, format!("no sound: {problem}"), theme::TEXT_FAINT, 10.5);
+        }
+        // Which engine, because it is the difference between "nothing to install" and "ffmpeg is
+        // capturing this", and because it is the first thing worth knowing when a share looks wrong.
+        line(
+            56.0,
+            format!(
+                "{} · {}×{}",
+                if share.native() { "ScreenCaptureKit" } else { "ffmpeg" },
+                share.width,
+                share.height
+            ),
+            theme::TEXT_FAINT,
+            10.5,
+        );
+        if let Some(trouble) = share.trouble() {
+            line(76.0, trouble, theme::WARN, 10.5);
         }
         return action;
     }

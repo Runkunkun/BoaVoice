@@ -121,7 +121,15 @@ objc2-screen-capture-kit = { version = "0.3", features = [
     "SCError",
     "SCShareableContent",
     "SCStream",
+    # The completion handlers on `startCapture`, the queue the sample handler runs on, and the sample
+    # buffer type itself: without these three the capture half of the API does not exist.
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
 ] }
+# How many pixels a display actually has, which is not what ScreenCaptureKit reports: its sizes are in
+# points, and capturing a Retina screen at its point size is a visibly soft picture.
+objc2-core-graphics = { version = "0.3", features = ["CGDirectDisplay", "CGDisplayConfiguration"] }
 # The hardware H.264 encoder. Replacing ffmpeg with this is what removes a 76 MB GPL binary from the
 # app rather than shipping one.
 objc2-video-toolbox = { version = "0.3", features = [

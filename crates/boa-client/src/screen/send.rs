@@ -43,13 +43,21 @@ pub struct Source {
 
 /// Everything this machine can share, in the order to offer it.
 ///
-/// Whole screens come first because they are what most shares are. Windows are listed where the
-/// platform can capture one at all — which on macOS it cannot, not through ffmpeg: avfoundation
-/// captures displays and nothing smaller. Single windows there need ScreenCaptureKit, which is the
-/// same piece of work as capturing system audio without a loopback device, and is not done yet.
+/// Whole screens come first because they are what most shares are, then windows — which is a list
+/// macOS can only give through ScreenCaptureKit. ffmpeg's avfoundation input captures displays and
+/// nothing smaller, so where this falls back to it the windows are simply missing rather than broken.
 pub fn sources() -> Vec<Source> {
     #[cfg(target_os = "macos")]
     {
+        // ScreenCaptureKit knows about windows, reports the real sizes, and needs nothing installed.
+        // Its failure is the interesting one: no screen-recording permission, which is worth logging
+        // here because the fallback below cannot capture either and will say something less useful.
+        match super::mac::content::sources() {
+            Ok(found) if !found.is_empty() => return found,
+            Ok(_) => log::warn!("screen: ScreenCaptureKit offered nothing to share"),
+            Err(why) => log::warn!("screen: ScreenCaptureKit: {why}"),
+        }
+
         let listing = super::ffmpeg::command()
             .and_then(|mut ffmpeg| {
                 ffmpeg
@@ -157,9 +165,23 @@ fn windows_windows() -> Vec<Source> {
         .collect()
 }
 
-/// A share in progress. Dropping it stops ffmpeg and the sending thread.
+/// What is producing the pictures.
+///
+/// Two engines, and which one runs is decided by what the source is rather than by a setting: a macOS
+/// source that ScreenCaptureKit knows about is captured in-process, and everything else — every other
+/// platform, and a Mac whose permission has not been granted — goes through ffmpeg.
+enum Engine {
+    /// In-process: ScreenCaptureKit into VideoToolbox. Nothing to install, single windows, and the
+    /// machine's own sound under the permission the share already needs.
+    #[cfg(target_os = "macos")]
+    Native(super::mac::capture::Capture),
+    /// A child process reading a capture device and writing H.264 to a pipe.
+    Ffmpeg(Arc<std::sync::Mutex<Child>>),
+}
+
+/// A share in progress. Dropping it stops the capture and the sending thread.
 pub struct Share {
-    child: Arc<std::sync::Mutex<Child>>,
+    engine: Engine,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub frames: Arc<AtomicU64>,
@@ -168,7 +190,8 @@ pub struct Share {
     /// slow. Four seconds of no frames is not a static screen — H.264 emits a keyframe every couple
     /// of seconds regardless — it is a capture that never started.
     pub started: Instant,
-    /// The size ffmpeg was asked for, which is what the far side is told to expect.
+    /// The size the picture is being sent at. The native engine reports what it actually configured;
+    /// with ffmpeg this is the box the picture was fitted into.
     pub width: u32,
     pub height: u32,
     /// The machine's own sound, when it was asked for and a device could be found.
@@ -213,76 +236,157 @@ impl Share {
             (None, None)
         };
 
-        let Some(mut ffmpeg) = super::ffmpeg::command() else {
-            bail!("{}", super::ffmpeg::advice());
-        };
-
-        let args = capture_args(settings, source, width, height);
-        log::info!("screen: ffmpeg {}", args.join(" "));
-        crate::diagnostics::note(&format!(
-            "screen: sharing {} at up to {width}×{height}, {} fps",
-            source.label, settings.fps
-        ));
-
-        let mut child = ffmpeg
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("starting ffmpeg")?;
-
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("ffmpeg has no stdout"))?;
-        let stderr = child.stderr.take();
-
-        // ffmpeg's diagnostics go to the log rather than to a pipe nobody reads — which is also what
-        // stops it blocking once the pipe's buffer fills, and it is the only place a "permission
-        // denied" from the screen-recording prompt will appear.
-        if let Some(stderr) = stderr {
-            let builder = std::thread::Builder::new().name("boa-screen-log".into());
-            let _ = builder.spawn(move || {
-                use std::io::BufRead as _;
-                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        log::debug!("ffmpeg: {line}");
-                    }
-                }
-            });
-        }
-
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
         let packets = Arc::new(AtomicU64::new(0));
-
-        let thread = {
-            let stop = stop.clone();
-            let frames = frames.clone();
-            let packets = packets.clone();
-            std::thread::Builder::new()
-                .name("boa-screen-tx".into())
-                .spawn(move || {
-                    if let Err(err) =
-                        pump(stdout, &transport, ssrc, &stop, &frames, &packets, preview)
-                    {
-                        log::error!("screen: {err:#}");
-                        crate::diagnostics::note(&format!("screen: send stopped: {err:#}"));
-                    }
-                })
-                .context("spawning the screen sender")?
+        let wiring = Wiring {
+            transport,
+            ssrc,
+            stop: stop.clone(),
+            frames: frames.clone(),
+            packets: packets.clone(),
+            preview,
         };
 
+        // The native engine where the source is one ScreenCaptureKit knows about. Not a fallback if it
+        // fails, deliberately: the reason it fails is nearly always the screen-recording permission, and
+        // ffmpeg cannot capture without that either — it would replace a clear message with a silent
+        // share of nothing.
+        #[cfg(target_os = "macos")]
+        if let Some(target) = super::mac::content::target(source) {
+            let started = native(target, settings, width, height, wiring)?;
+            return Ok(Share {
+                engine: started.engine,
+                stop,
+                thread: Some(started.thread),
+                frames,
+                packets,
+                started: Instant::now(),
+                width: started.width,
+                height: started.height,
+                audio,
+                audio_problem,
+            });
+        }
+
+        let started = spawn_ffmpeg(settings, source, width, height, wiring)?;
         Ok(Share {
-            child: Arc::new(std::sync::Mutex::new(child)),
+            engine: started.engine,
             stop,
-            thread: Some(thread),
+            thread: Some(started.thread),
             frames,
             packets,
             started: Instant::now(),
-            width,
-            height,
+            width: started.width,
+            height: started.height,
             audio,
             audio_problem,
         })
     }
+}
+
+/// A started engine and the thread putting its pictures on the wire.
+struct Started {
+    engine: Engine,
+    thread: std::thread::JoinHandle<()>,
+    width: u32,
+    height: u32,
+}
+
+/// Everything the sending thread needs, whichever engine produced the pictures.
+struct Wiring {
+    transport: Transport,
+    ssrc: u32,
+    stop: Arc<AtomicBool>,
+    frames: Arc<AtomicU64>,
+    packets: Arc<AtomicU64>,
+    preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
+}
+
+/// Capture with ScreenCaptureKit and encode with VideoToolbox, in this process.
+#[cfg(target_os = "macos")]
+fn native(
+    target: super::mac::content::Target,
+    settings: &ScreenSettings,
+    width: u32,
+    height: u32,
+    wiring: Wiring,
+) -> Result<Started> {
+    let mut capture =
+        super::mac::capture::Capture::start(target, width, height, settings.fps, settings.kbps)?;
+    let (width, height) = (capture.width, capture.height);
+    let pictures = capture
+        .pictures()
+        .ok_or_else(|| anyhow!("the capture has already been taken over"))?;
+
+    let thread = std::thread::Builder::new()
+        .name("boa-screen-tx".into())
+        .spawn(move || pump_pictures(pictures, wiring))
+        .context("spawning the screen sender")?;
+
+    Ok(Started { engine: Engine::Native(capture), thread, width, height })
+}
+
+/// Capture with ffmpeg, as a child process.
+fn spawn_ffmpeg(
+    settings: &ScreenSettings,
+    source: &Source,
+    width: u32,
+    height: u32,
+    wiring: Wiring,
+) -> Result<Started> {
+    let Some(mut ffmpeg) = super::ffmpeg::command() else {
+        bail!("{}", super::ffmpeg::advice());
+    };
+
+    let args = capture_args(settings, source, width, height);
+    log::info!("screen: ffmpeg {}", args.join(" "));
+    crate::diagnostics::note(&format!(
+        "screen: sharing {} at up to {width}×{height}, {} fps",
+        source.label, settings.fps
+    ));
+
+    let mut child = ffmpeg
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting ffmpeg")?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("ffmpeg has no stdout"))?;
+    let stderr = child.stderr.take();
+
+    // ffmpeg's diagnostics go to the log rather than to a pipe nobody reads — which is also what
+    // stops it blocking once the pipe's buffer fills, and it is the only place a "permission
+    // denied" from the screen-recording prompt will appear.
+    if let Some(stderr) = stderr {
+        let builder = std::thread::Builder::new().name("boa-screen-log".into());
+        let _ = builder.spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    log::debug!("ffmpeg: {line}");
+                }
+            }
+        });
+    }
+
+    let thread = std::thread::Builder::new()
+        .name("boa-screen-tx".into())
+        .spawn(move || {
+            if let Err(err) = pump(stdout, wiring) {
+                log::error!("screen: {err:#}");
+                crate::diagnostics::note(&format!("screen: send stopped: {err:#}"));
+            }
+        })
+        .context("spawning the screen sender")?;
+
+    Ok(Started {
+        engine: Engine::Ffmpeg(Arc::new(std::sync::Mutex::new(child))),
+        thread,
+        width,
+        height,
+    })
 }
 
 impl Share {
@@ -295,6 +399,42 @@ impl Share {
     pub fn audio_packets(&self) -> u64 {
         self.audio.as_ref().map(|audio| audio.packets.load(Ordering::Relaxed)).unwrap_or(0)
     }
+
+    /// Whether this is being captured in-process rather than by ffmpeg.
+    ///
+    /// Shown in the diagnostics, because it is the answer to "why does my Mac not need ffmpeg" and to
+    /// "why is this share missing the sound".
+    pub fn native(&self) -> bool {
+        match self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Native(_) => true,
+            Engine::Ffmpeg(_) => false,
+        }
+    }
+
+    /// What went wrong with the capture, if the platform has told us.
+    ///
+    /// Only the native engine can answer: it gets "the window you were sharing has closed" or "the
+    /// permission was withdrawn" as an event, where ffmpeg gets a dead child process and a log line.
+    pub fn trouble(&self) -> Option<String> {
+        match &self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Native(capture) => capture.trouble(),
+            Engine::Ffmpeg(_) => None,
+        }
+    }
+
+    /// Ask for a keyframe now, so somebody who has just started watching sees a picture.
+    ///
+    /// A no-op with ffmpeg: its keyframe interval is set on the command line and there is no way to ask
+    /// mid-stream, which is one more reason the native engine is the better one.
+    pub fn want_keyframe(&self) {
+        match &self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Native(capture) => capture.want_keyframe(),
+            Engine::Ffmpeg(_) => {}
+        }
+    }
 }
 
 impl Drop for Share {
@@ -302,12 +442,15 @@ impl Drop for Share {
         self.stop.store(true, Ordering::Release);
         // The audio process first: it is the one holding a device somebody else may want back.
         self.audio = None;
-        // Killed rather than asked politely. ffmpeg reading from a capture device does not notice a
-        // closed stdout until it tries to write, which on an idle screen can be a whole frame
+        // ffmpeg is killed rather than asked politely: reading from a capture device it does not notice
+        // a closed stdout until it tries to write, which on an idle screen can be a whole frame
         // interval — and on macOS the screen-recording indicator stays lit until the process is gone.
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        // The native engine stops its stream in its own `Drop`, synchronously, for the same reason.
+        if let Engine::Ffmpeg(child) = &self.engine {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -443,61 +586,104 @@ fn encoder() -> &'static str {
     }
 }
 
+/// One picture at a time, onto the wire and into the preview.
+///
+/// The part both engines share — and the reason it is a type rather than a function is the sequence
+/// number and the two scratch buffers, which have to live across pictures.
+struct Wire {
+    wiring: Wiring,
+    payload: Vec<u8>,
+    scratch: Vec<u8>,
+    seq: u32,
+    start: Instant,
+}
+
+impl Wire {
+    fn new(wiring: Wiring) -> Wire {
+        Wire {
+            wiring,
+            payload: Vec::with_capacity(1_200),
+            scratch: Vec::with_capacity(1_200),
+            seq: 0,
+            start: Instant::now(),
+        }
+    }
+
+    fn put(&mut self, picture: &Picture) {
+        self.wiring.frames.fetch_add(1, Ordering::Relaxed);
+
+        // The local preview gets the picture whole, before it is cut up. `try_send` and a small
+        // queue: if the local decoder has fallen behind, the newest picture is the one worth having
+        // and the sending must not wait for it — the people watching come first.
+        if let Some(preview) = self.wiring.preview.as_ref() {
+            let _ = preview.try_send((picture.keyframe, picture.data.clone()));
+        }
+
+        let kind = if picture.keyframe { MediaKind::VideoKey } else { MediaKind::VideoDelta };
+        // Milliseconds since the share started, the same for every fragment of one picture — which is
+        // also how the far side knows which fragments belong together.
+        let timestamp = self.start.elapsed().as_millis() as u32;
+
+        for (index, count, chunk) in fragment(&picture.data) {
+            write_fragment(index, count, chunk, &mut self.payload);
+            self.seq = self.seq.wrapping_add(1);
+            let header = PacketHeader { kind, ssrc: self.wiring.ssrc, seq: self.seq, timestamp };
+            match self.wiring.transport.send(header, &self.payload, &mut self.scratch) {
+                Ok(()) => {
+                    self.wiring.packets.fetch_add(1, Ordering::Relaxed);
+                }
+                // One packet failing is not a reason to stop sharing: the link may be briefly full,
+                // and the next keyframe repairs whatever this one broke.
+                Err(err) => log::debug!("screen: sending: {err:#}"),
+            }
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.wiring.stop.load(Ordering::Acquire)
+    }
+}
+
 /// Read ffmpeg's output and put it on the wire.
-#[allow(clippy::too_many_arguments)]
-fn pump(
-    mut stdout: std::process::ChildStdout,
-    transport: &Transport,
-    ssrc: u32,
-    stop: &AtomicBool,
-    frames: &AtomicU64,
-    packets: &AtomicU64,
-    preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
-) -> Result<()> {
+fn pump(mut stdout: std::process::ChildStdout, wiring: Wiring) -> Result<()> {
     let mut reader = Annexb::default();
     let mut buffer = vec![0u8; 64 * 1024];
-    let mut payload = Vec::with_capacity(1_200);
-    let mut scratch = Vec::with_capacity(1_200);
-    let mut seq: u32 = 0;
-    let start = Instant::now();
+    let mut wire = Wire::new(wiring);
 
-    while !stop.load(Ordering::Acquire) {
+    while !wire.stopped() {
         let read = stdout.read(&mut buffer).context("reading from ffmpeg")?;
         if read == 0 {
             log::info!("screen: ffmpeg finished");
             return Ok(());
         }
-
-        for frame in reader.feed(&buffer[..read]) {
-            frames.fetch_add(1, Ordering::Relaxed);
-
-            // The local preview gets the picture whole, before it is cut up. `try_send` and a small
-            // queue: if the local decoder has fallen behind, the newest picture is the one worth
-            // having and the sending must not wait for it — the people watching come first.
-            if let Some(preview) = preview.as_ref() {
-                let _ = preview.try_send((frame.keyframe, frame.data.clone()));
-            }
-            let kind = if frame.keyframe { MediaKind::VideoKey } else { MediaKind::VideoDelta };
-            // Milliseconds since the share started, the same for every fragment of one picture —
-            // which is also how the far side knows which fragments belong together.
-            let timestamp = start.elapsed().as_millis() as u32;
-
-            for (index, count, chunk) in fragment(&frame.data) {
-                write_fragment(index, count, chunk, &mut payload);
-                seq = seq.wrapping_add(1);
-                let header = PacketHeader { kind, ssrc, seq, timestamp };
-                match transport.send(header, &payload, &mut scratch) {
-                    Ok(()) => {
-                        packets.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // One packet failing is not a reason to stop sharing: the link may be briefly
-                    // full, and the next keyframe repairs whatever this one broke.
-                    Err(err) => log::debug!("screen: sending: {err:#}"),
-                }
-            }
+        for picture in reader.feed(&buffer[..read]) {
+            wire.put(&picture);
         }
     }
     Ok(())
+}
+
+/// Put the pictures the native encoder produces on the wire.
+///
+/// A blocking receive with a timeout rather than polling: a still screen produces nothing for as long as
+/// it stays still, and this thread should be asleep for that whole time rather than waking up sixty times
+/// a second to find nothing. The timeout is what lets it notice that the share has been stopped.
+#[cfg(target_os = "macos")]
+fn pump_pictures(pictures: std::sync::mpsc::Receiver<super::mac::encode::Picture>, wiring: Wiring) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut wire = Wire::new(wiring);
+    while !wire.stopped() {
+        match pictures.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(picture) => {
+                wire.put(&Picture { data: picture.data, keyframe: picture.keyframe });
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // The encoder has gone, which happens when the capture is dropped. Nothing to report: the
+            // share is over and something else said so.
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// One picture, ready to send.
