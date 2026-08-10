@@ -280,8 +280,11 @@ impl Share {
             started: Instant::now(),
             width: started.width,
             height: started.height,
-            audio,
-            audio_problem,
+            // The engine's own sound first, then the loopback device found above. ffmpeg never has the
+            // former, and taking both from the same place keeps one field to read rather than two paths
+            // to keep in step.
+            audio: started.audio.or(audio),
+            audio_problem: started.audio_problem.or(audio_problem),
         })
     }
 }
@@ -479,10 +482,16 @@ impl Drop for Share {
         // a closed stdout until it tries to write, which on an idle screen can be a whole frame
         // interval — and on macOS the screen-recording indicator stays lit until the process is gone.
         // The native engine stops its stream in its own `Drop`, synchronously, for the same reason.
-        if let Engine::Ffmpeg(child) = &self.engine {
-            if let Ok(mut child) = child.lock() {
-                let _ = child.kill();
-                let _ = child.wait();
+        // A `match` rather than an `if let`: off macOS there is only one engine, and an `if let` on a
+        // single-variant enum is a warning rather than a pattern.
+        match &self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Native(_) => {}
+            Engine::Ffmpeg(child) => {
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
         if let Some(thread) = self.thread.take() {
