@@ -170,11 +170,19 @@ pub fn show(
                 let top = ui.cursor().top();
                 ui.add_space(10.0);
 
-                let mut edge = settings.screen.max_dimension as f32;
-                if slider(ui, "Longest edge", &mut edge, 640.0..=3840.0, |v| format!("{v:.0} px")) {
-                    settings.screen.max_dimension = edge as u32;
-                    changed = true;
-                }
+                // No resolution here. What to share is picked when the button is pressed — a screen or
+                // a window — and the picture keeps that source's own resolution. A pixel setting would
+                // be a second, quieter answer to a question already asked, and the wrong one whenever
+                // the two disagree.
+                ui.label(
+                    egui::RichText::new(
+                        "Shared at the source's own resolution. You pick the screen or window when \
+                         you start sharing.",
+                    )
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(6.0);
                 let mut fps = settings.screen.fps as f32;
                 if slider(ui, "Frame rate", &mut fps, 5.0..=144.0, |v| format!("{v:.0} fps")) {
                     settings.screen.fps = fps as u32;

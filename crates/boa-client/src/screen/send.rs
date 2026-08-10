@@ -14,7 +14,7 @@
 //! multi-slice stream would emit each slice as its own frame, which still decodes but wastes packets.
 
 use std::io::Read as _;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,17 +25,136 @@ use boa_proto::media::{fragment, write_fragment, MediaKind, PacketHeader};
 use crate::media::Transport;
 use crate::settings::ScreenSettings;
 
-/// Whether ffmpeg is on the path.
+/// Something that can be shared.
 ///
-/// Checked before offering to share rather than after failing to, so the message is "install ffmpeg"
-/// instead of "the share stopped".
-pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
+/// A *choice*, not a set of dimensions. What somebody wants to say is "this screen" or "that window";
+/// the resolution follows from the source and is capped only where a decoder would give up. The old
+/// arrangement — a pixel slider and whichever display happened to be first — asked the wrong question
+/// and then answered it without looking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    /// What ffmpeg is told to read.
+    pub input: String,
+    /// What the interface calls it.
+    pub label: String,
+    /// A window rather than a whole screen.
+    pub window: bool,
+}
+
+/// Everything this machine can share, in the order to offer it.
+///
+/// Whole screens come first because they are what most shares are. Windows are listed where the
+/// platform can capture one at all — which on macOS it cannot, not through ffmpeg: avfoundation
+/// captures displays and nothing smaller. Single windows there need ScreenCaptureKit, which is the
+/// same piece of work as capturing system audio without a loopback device, and is not done yet.
+pub fn sources() -> Vec<Source> {
+    #[cfg(target_os = "macos")]
+    {
+        let listing = super::ffmpeg::command()
+            .and_then(|mut ffmpeg| {
+                ffmpeg
+                    .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+                    .stderr(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .output()
+                    .ok()
+            })
+            .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+            .unwrap_or_default();
+        let found = parse_screens(&listing);
+        if found.is_empty() {
+            // A machine whose device listing could not be read still gets an entry, because refusing
+            // to offer anything is worse than offering the one that is almost always right.
+            return vec![Source { input: "1".into(), label: "Screen".into(), window: false }];
+        }
+        found
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut found =
+            vec![Source { input: "desktop".into(), label: "Whole desktop".into(), window: false }];
+        found.extend(windows_windows());
+        found
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
+        vec![Source { input: display.clone(), label: format!("Screen ({display})"), window: false }]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Pull the screens out of an avfoundation device listing.
+///
+/// The video half only, and only the entries that are displays: a webcam and a virtual camera sit in
+/// the same list, and sharing one of those instead of the screen is a mistake that looks like a bug in
+/// the receiver.
+#[cfg(target_os = "macos")]
+fn parse_screens(listing: &str) -> Vec<Source> {
+    let mut found = Vec::new();
+    let mut in_video = false;
+    for line in listing.lines() {
+        if line.contains("AVFoundation video devices") {
+            in_video = true;
+            continue;
+        }
+        if line.contains("AVFoundation audio devices") {
+            in_video = false;
+            continue;
+        }
+        if !in_video || !line.contains("Capture screen") {
+            continue;
+        }
+        let Some(open) = line.rfind('[') else { continue };
+        let Some(close) = line[open..].find(']').map(|offset| open + offset) else { continue };
+        let index = line[open + 1..close].trim().to_string();
+        let name = line[close + 1..].trim();
+        found.push(Source {
+            input: index,
+            // "Capture screen 0" is ffmpeg's phrasing, not something to show somebody.
+            label: match name.rsplit(' ').next().and_then(|n| n.parse::<u32>().ok()) {
+                Some(0) => "Main screen".to_string(),
+                Some(n) => format!("Screen {}", n + 1),
+                None => name.to_string(),
+            },
+            window: false,
+        });
+    }
+    found
+}
+
+/// The visible top-level windows, by title.
+///
+/// gdigrab addresses a window by its title, which is also its weakness: two windows with the same
+/// title are indistinguishable, and a title that changes while sharing does not follow. It is what
+/// Windows offers without a native capture path, and it works for the case people want — one
+/// application, deliberately chosen.
+#[cfg(target_os = "windows")]
+fn windows_windows() -> Vec<Source> {
+    let script = "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | \
+                  ForEach-Object { $_.MainWindowTitle }";
+    let Ok(out) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .take(40)
+        .map(|title| Source {
+            input: format!("title={title}"),
+            label: title.to_string(),
+            window: true,
+        })
+        .collect()
 }
 
 /// A share in progress. Dropping it stops ffmpeg and the sending thread.
@@ -45,6 +164,10 @@ pub struct Share {
     thread: Option<std::thread::JoinHandle<()>>,
     pub frames: Arc<AtomicU64>,
     pub packets: Arc<AtomicU64>,
+    /// When capture began, so a share that produces nothing can be recognised as broken rather than
+    /// slow. Four seconds of no frames is not a static screen — H.264 emits a keyframe every couple
+    /// of seconds regardless — it is a capture that never started.
+    pub started: Instant,
     /// The size ffmpeg was asked for, which is what the far side is told to expect.
     pub width: u32,
     pub height: u32,
@@ -66,6 +189,7 @@ impl Share {
         transport: Transport,
         ssrc: u32,
         settings: &ScreenSettings,
+        source: &Source,
         width: u32,
         height: u32,
     ) -> Result<Share> {
@@ -87,19 +211,21 @@ impl Share {
             (None, None)
         };
 
-        if !ffmpeg_available() {
-            bail!("sharing a screen needs ffmpeg on the PATH (watching one does not)");
-        }
+        let Some(mut ffmpeg) = super::ffmpeg::command() else {
+            bail!("{}", super::ffmpeg::advice());
+        };
 
-        let args = capture_args(settings, width, height);
+        let args = capture_args(settings, source, width, height);
         log::info!("screen: ffmpeg {}", args.join(" "));
-        crate::diagnostics::note(&format!("screen: sharing {width}×{height} at {} fps", settings.fps));
+        crate::diagnostics::note(&format!(
+            "screen: sharing {} at up to {width}×{height}, {} fps",
+            source.label, settings.fps
+        ));
 
-        let mut child = Command::new("ffmpeg")
+        let mut child = ffmpeg
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
             .spawn()
             .context("starting ffmpeg")?;
 
@@ -146,6 +272,7 @@ impl Share {
             thread: Some(thread),
             frames,
             packets,
+            started: Instant::now(),
             width,
             height,
             audio,
@@ -188,7 +315,12 @@ impl Drop for Share {
 /// The ffmpeg command line for this platform.
 ///
 /// Separated out and pure so the test below can check the flags that matter without running anything.
-fn capture_args(settings: &ScreenSettings, width: u32, height: u32) -> Vec<String> {
+fn capture_args(
+    settings: &ScreenSettings,
+    source: &Source,
+    width: u32,
+    height: u32,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -198,13 +330,16 @@ fn capture_args(settings: &ScreenSettings, width: u32, height: u32) -> Vec<Strin
         "-nostdin".into(),
     ];
 
-    args.extend(platform_input(settings.fps));
+    args.extend(platform_input(settings.fps, source));
 
     args.extend([
         // Scale to fit, keeping the aspect. `-2` rather than `-1` on the derived edge, because H.264
         // requires even dimensions and an odd one is rejected outright.
+        // `decrease` and nothing else: the picture keeps the source's own resolution unless it is
+        // larger than a decoder will take, in which case it is fitted inside that. There is no
+        // resolution to choose, because "share this screen" already says what to send.
         "-vf".into(),
-        format!("scale={width}:{height}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"),
+        format!("scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"),
         "-c:v".into(),
         encoder().into(),
     ]);
@@ -254,13 +389,9 @@ fn capture_args(settings: &ScreenSettings, width: u32, height: u32) -> Vec<Strin
     args
 }
 
-/// The capture input for this platform.
-fn platform_input(fps: u32) -> Vec<String> {
+/// The capture input for this platform and this source.
+fn platform_input(fps: u32, source: &Source) -> Vec<String> {
     if cfg!(target_os = "macos") {
-        // The screen's index is not fixed: it comes after every camera and virtual camera the machine
-        // has, so it is looked up rather than guessed. `1:none` — the usual example — is somebody
-        // else's webcam on a machine with two of them.
-        let index = macos_screen_index().unwrap_or(1);
         vec![
             "-f".into(),
             "avfoundation".into(),
@@ -272,7 +403,7 @@ fn platform_input(fps: u32) -> Vec<String> {
             // machine, and naming one that a given display does not support fails the capture
             // outright. The filter chain converts whatever arrives.
             "-i".into(),
-            index.to_string(),
+            source.input.clone(),
         ]
     } else if cfg!(target_os = "windows") {
         vec![
@@ -281,19 +412,18 @@ fn platform_input(fps: u32) -> Vec<String> {
             "-framerate".into(),
             fps.to_string(),
             "-i".into(),
-            "desktop".into(),
+            source.input.clone(),
         ]
     } else {
         // X11. Wayland needs PipeWire and a portal dialogue, which is a different mechanism
         // altogether — under a Wayland session this fails and the log says why.
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
         vec![
             "-f".into(),
             "x11grab".into(),
             "-framerate".into(),
             fps.to_string(),
             "-i".into(),
-            display,
+            source.input.clone(),
         ]
     }
 }
@@ -307,35 +437,6 @@ fn encoder() -> &'static str {
     } else {
         "libx264"
     }
-}
-
-/// Ask ffmpeg which avfoundation index is the screen.
-fn macos_screen_index() -> Option<u32> {
-    let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .output()
-        .ok()?;
-    // The listing goes to stderr, and the command "fails" — listing devices is not a conversion.
-    let text = String::from_utf8_lossy(&output.stderr);
-    parse_screen_index(&text)
-}
-
-/// Pull `[2] Capture screen 0` out of an avfoundation device listing.
-fn parse_screen_index(listing: &str) -> Option<u32> {
-    for line in listing.lines() {
-        if !line.contains("Capture screen") {
-            continue;
-        }
-        let start = line.find('[')?;
-        // Two bracketed fields per line — the log's own tag, then the index — so the *last* one
-        // before the name is the one wanted.
-        let index = line[start..].rfind('[').map(|offset| start + offset)?;
-        let end = line[index..].find(']')? + index;
-        return line[index + 1..end].trim().parse().ok();
-    }
-    None
 }
 
 /// Read ffmpeg's output and put it on the wire.
@@ -646,33 +747,73 @@ mod tests {
         assert!(pictures.iter().all(|p| !p.keyframe));
     }
 
+    /// The listing has cameras and virtual cameras in it, and the audio half repeats the numbering.
+    /// Offering a webcam as "your screen" is a mistake that looks like a bug in the receiver.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn the_screen_index_is_read_from_the_device_listing() {
-        // The real shape of the output, including the log tag that also has brackets.
+    fn only_the_screens_are_offered_and_they_are_named_for_people() {
         let listing = "\
 [AVFoundation indev @ 0x7c7101c140] AVFoundation video devices:
 [AVFoundation indev @ 0x7c7101c140] [0] Elgato HD60 X
 [AVFoundation indev @ 0x7c7101c140] [1] OBS Virtual Camera
 [AVFoundation indev @ 0x7c7101c140] [2] Capture screen 0
-[AVFoundation indev @ 0x7c7101c140] AVFoundation audio devices:";
-        assert_eq!(parse_screen_index(listing), Some(2));
-        assert_eq!(parse_screen_index("nothing here"), None);
+[AVFoundation indev @ 0x7c7101c140] [3] Capture screen 1
+[AVFoundation indev @ 0x7c7101c140] AVFoundation audio devices:
+[AVFoundation indev @ 0x7c7101c140] [2] Some Microphone";
+        let screens = parse_screens(listing);
+        assert_eq!(screens.len(), 2);
+        assert_eq!(screens[0].input, "2");
+        assert_eq!(screens[0].label, "Main screen");
+        assert_eq!(screens[1].input, "3");
+        assert_eq!(screens[1].label, "Screen 2");
+        assert!(screens.iter().all(|s| !s.window));
+
+        assert!(parse_screens("nothing here").is_empty());
+        // The microphone in the audio half must not become a screen.
+        assert!(parse_screens(
+            "[x] AVFoundation audio devices:\n[x] [0] Capture screen 0"
+        )
+        .is_empty());
+    }
+
+    /// Whatever the machine says, there is always something to offer — refusing to offer anything is
+    /// worse than offering the one that is nearly always right.
+    #[test]
+    fn there_is_always_at_least_one_source() {
+        assert!(!sources().is_empty());
     }
 
     #[test]
     fn the_command_line_carries_the_settings_and_nothing_that_adds_delay() {
         let settings = ScreenSettings { max_dimension: 1920, fps: 60, kbps: 8_000, with_audio: false };
-        let args = capture_args(&settings, 1920, 1080).join(" ");
+        let source = Source { input: "2".into(), label: "Main screen".into(), window: false };
+        let args = capture_args(&settings, &source, 1920, 1080).join(" ");
 
         assert!(args.contains("scale=1920:1080"), "{args}");
+        assert!(args.contains("-i 2"), "the chosen source, not a guess: {args}");
         assert!(args.contains("-b:v 8000k"), "{args}");
         // Two seconds between keyframes.
         assert!(args.contains("-g 120"), "{args}");
         // Annex-B on stdout, which is what the packetiser expects.
         assert!(args.ends_with("-f h264 -"), "{args}");
-        // Even dimensions, or H.264 refuses the stream outright.
-        assert!(args.contains("trunc(iw/2)*2"), "{args}");
+        // Even dimensions, or H.264 refuses the stream outright. `force_divisible_by` does it in the
+        // one scale pass that also fits the source; the two-stage `trunc(iw/2)*2` version it replaced
+        // scaled twice for the same result.
+        assert!(args.contains("force_divisible_by=2"), "{args}");
         assert!(args.contains("-nostdin"), "{args}");
+    }
+
+    /// The picture keeps the source's resolution unless a decoder would refuse it — there is no
+    /// resolution setting, because choosing a screen already says what to send.
+    #[test]
+    fn the_source_keeps_its_own_resolution_up_to_the_cap() {
+        let settings =
+            ScreenSettings { max_dimension: 3_840, fps: 60, kbps: 20_000, with_audio: false };
+        let source = Source { input: "2".into(), label: "Main screen".into(), window: false };
+        let args = capture_args(&settings, &source, 3_840, 2_160).join(" ");
+        assert!(args.contains("force_original_aspect_ratio=decrease"), "{args}");
+        // Even dimensions without a second scale pass, which the two-stage version needed.
+        assert!(args.contains("force_divisible_by=2"), "{args}");
     }
 
     #[test]
@@ -681,7 +822,8 @@ mod tests {
         // command line says so.
         let settings =
             ScreenSettings { max_dimension: 3_840, fps: 120, kbps: 100_000, with_audio: false };
-        let args = capture_args(&settings, 3_840, 2_160).join(" ");
+        let source = Source { input: "desktop".into(), label: "Whole desktop".into(), window: false };
+        let args = capture_args(&settings, &source, 3_840, 2_160).join(" ");
         assert!(args.contains("-b:v 100000k"), "{args}");
         assert!(args.contains("-g 240"), "{args}");
     }

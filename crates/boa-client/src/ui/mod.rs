@@ -65,6 +65,9 @@ pub enum Action {
     ToggleMute,
     ToggleDeafen,
     StartScreen,
+    /// One of the things offered by the picker.
+    ShareSource(crate::screen::Source),
+    CancelSharePicker,
     StopScreen,
     Watch(Id),
     Unwatch(Id),
@@ -190,6 +193,10 @@ pub struct App {
     watcher: Option<(Id, crate::screen::Watcher)>,
     /// The texture the watched screen is drawn from, with the frame number it came from.
     screen_texture: Option<(egui::TextureHandle, u64)>,
+    /// The sources offered while somebody is choosing what to share.
+    picking: Option<Vec<crate::screen::Source>>,
+    /// What they chose, kept until the server hands back a stream id for it.
+    pending_source: Option<crate::screen::Source>,
     /// Direct file transfers: the thread that runs them, and what is in flight.
     transfers: crate::transfer::Transfers,
     active_transfers: Vec<transfers::Active>,
@@ -238,6 +245,8 @@ impl App {
             voice: None,
             announced_speaking: false,
             share: None,
+            picking: None,
+            pending_source: None,
             watcher: None,
             screen_texture: None,
             transfers: crate::transfer::Transfers::spawn(cc.egui_ctx.clone()),
@@ -560,6 +569,12 @@ impl App {
     /// Start ffmpeg on the stream id the server allocated.
     fn begin_capture(&mut self, ssrc: u32) {
         let Some(session) = self.voice.as_ref() else { return };
+        // Whatever was chosen when the button was pressed. Absent means the server announced a share
+        // this client did not start, which is not something to guess about.
+        let Some(source) = self.pending_source.clone() else {
+            log::warn!("screen: a share was announced with no source chosen");
+            return;
+        };
         let transport = match session.transport() {
             Ok(transport) => transport,
             Err(err) => {
@@ -574,7 +589,7 @@ impl App {
         // this is the ceiling rather than a promise.
         let height = (width * 9 / 16).max(2);
 
-        match crate::screen::Share::start(transport, ssrc, &settings, width, height) {
+        match crate::screen::Share::start(transport, ssrc, &settings, &source, width, height) {
             Ok(share) => {
                 let sound = match (share.audio_device(), &share.audio_problem) {
                     (Some(device), _) => format!(", sound from {device}"),
@@ -582,7 +597,8 @@ impl App {
                     (None, None) => ", no sound".to_string(),
                 };
                 self.notify(Notice::success(format!(
-                    "sharing your screen at up to {width}px, {} fps, {} Mbit/s{sound}",
+                    "sharing {} · {} fps · {} Mbit/s{sound}",
+                    source.label,
                     settings.fps,
                     settings.kbps as f32 / 1000.0
                 )));
@@ -610,6 +626,35 @@ impl App {
             session.stop_watching();
         }
         self.screen_texture = None;
+    }
+
+    /// Notice a share that is running but producing nothing.
+    ///
+    /// The failure this catches is the common one on macOS: ffmpeg starts, the screen-recording
+    /// permission has not been granted, and it exits or produces no frames. From the outside that is
+    /// a share everybody sees as active and nobody can see anything in — worse than no share at all,
+    /// because the person sharing has no reason to suspect it.
+    fn check_share(&mut self) {
+        let Some(share) = self.share.as_ref() else { return };
+        // A static screen still produces frames: H.264 sends a keyframe every couple of seconds, and
+        // the encoder emits something for every capture tick. Nothing at all after four seconds means
+        // nothing is being captured.
+        if share.started.elapsed() < Duration::from_secs(4) {
+            return;
+        }
+        if share.frames.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return;
+        }
+        self.share = None;
+        self.net.send_msg(ClientMsg::StopScreen);
+        self.notify(Notice::error(
+            if cfg!(target_os = "macos") {
+                "the screen share captured nothing. macOS needs Privacy & Security → \
+                 Screen & System Audio Recording → BoaVoice, and the app has to be restarted after."
+            } else {
+                "the screen share captured nothing — see last-run.log for what ffmpeg said"
+            },
+        ));
     }
 
     /// Upload a newly decoded screen frame, if there is one.
@@ -929,11 +974,38 @@ impl App {
                 }
                 if !crate::screen::ffmpeg_available() {
                     // Said before anything is announced, rather than after a share that sends
-                    // nothing: watching needs no ffmpeg, sharing does.
-                    self.notify(Notice::error(
-                        "sharing a screen needs ffmpeg installed (watching one does not)",
-                    ));
+                    // nothing — and it names the places that were searched, because the commonest
+                    // cause is not a missing ffmpeg but an app that cannot see the one installed.
+                    self.notify(Notice::error(crate::screen::ffmpeg::advice()));
                     return;
+                }
+                // The app asks for the permission itself rather than leaving it to whatever ffmpeg
+                // triggers — and it has to happen *before* anything is announced, because macOS will
+                // not grant it to a process that is already running.
+                match crate::platform::request_screen_access() {
+                    crate::platform::ScreenAccess::Granted
+                    | crate::platform::ScreenAccess::Unknown => {}
+                    crate::platform::ScreenAccess::AskedForIt => {
+                        self.notify(Notice::info(
+                            "allow BoaVoice under Screen & System Audio Recording, then restart it — \
+                             macOS only grants this to a process that starts afterwards",
+                        ));
+                        return;
+                    }
+                }
+
+                // What to share is a choice, not a setting. One source shares itself; several ask.
+                let found = crate::screen::sources();
+                match found.len() {
+                    0 => {
+                        self.notify(Notice::error("nothing to share was found"));
+                        return;
+                    }
+                    1 => self.pending_source = found.into_iter().next(),
+                    _ => {
+                        self.picking = Some(found);
+                        return;
+                    }
                 }
                 let screen = self.settings.screen;
                 // The height follows from the longest edge and the display's own shape, which the
@@ -947,6 +1019,21 @@ impl App {
                     with_audio: screen.with_audio,
                 }));
             }
+
+            Action::ShareSource(source) => {
+                self.picking = None;
+                self.pending_source = Some(source);
+                let screen = self.settings.screen;
+                self.net.send_msg(ClientMsg::StartScreen(boa_proto::control::ScreenRequest {
+                    width: screen.max_dimension,
+                    height: screen.max_dimension * 9 / 16,
+                    fps: screen.fps,
+                    kbps: screen.kbps,
+                    with_audio: screen.with_audio,
+                }));
+            }
+
+            Action::CancelSharePicker => self.picking = None,
 
             Action::StopScreen => {
                 // Locally first: ffmpeg should stop, and the platform's recording indicator go out,
@@ -1082,6 +1169,7 @@ impl eframe::App for App {
         self.pump_transfers();
         self.poll_voice(ctx);
         self.poll_screen(ctx);
+        self.check_share();
         self.images.collect(ctx);
         self.state.expire();
         self.notices.retain(|notice| !notice.expired());
@@ -1096,6 +1184,27 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 title_bar(ui, &self.state, &self.status, &self.view, self.logo.as_ref());
             });
+
+        // Notices go in their own strip, above the voice bar and below everything else. They used to
+        // be drawn at the end of the content area — which in the channel view is *after* the log and
+        // the composer have taken the whole height, so they were laid out past the bottom edge and
+        // never seen. A failed action that explains itself off-screen is indistinguishable from an
+        // action that did nothing, which is exactly how this was found.
+        if !self.notices.is_empty() {
+            let lines = self.notices.len().min(4) as f32;
+            egui::Panel::bottom("notices")
+                .exact_size(lines * 17.0 + 8.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 2)))
+                .show(ui, |ui| {
+                    for notice in self.notices.iter().rev() {
+                        ui.label(
+                            egui::RichText::new(&notice.text).size(11.0).color(notice.colour()),
+                        );
+                    }
+                });
+        }
 
         let connected = self.state.me.is_some();
 
@@ -1199,11 +1308,11 @@ impl eframe::App for App {
                     }
                 }
 
-                // Notices, over everything, at the bottom.
-                for notice in self.notices.iter().rev() {
-                    ui.label(egui::RichText::new(&notice.text).size(11.0).color(notice.colour()));
-                }
             });
+
+        if let Some(offered) = self.picking.clone() {
+            actions.extend(share_picker(ctx, &offered));
+        }
 
         for action in actions {
             self.apply(action);
@@ -1362,6 +1471,66 @@ fn watching(
         }
     }
 
+    action
+}
+
+/// Ask what to share.
+///
+/// A floating window rather than a settings page, because this is a question asked at the moment of
+/// pressing the button and answered once — the answer is not a preference worth keeping. Screens come
+/// first, then windows, which is the order people look for them in.
+fn share_picker(ctx: &egui::Context, offered: &[crate::screen::Source]) -> Option<Action> {
+    let mut action = None;
+    let mut open = true;
+    egui::Window::new("Share a screen")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(280.0);
+            ui.label(
+                egui::RichText::new("Everyone in the call can ask to watch it.")
+                    .size(10.5)
+                    .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(6.0);
+
+            let (screens, windows): (Vec<_>, Vec<_>) =
+                offered.iter().partition(|source| !source.window);
+
+            for source in &screens {
+                if widgets::pill_button(ui, &source.label, true).clicked() {
+                    action = Some(Action::ShareSource((*source).clone()));
+                }
+                ui.add_space(2.0);
+            }
+            if !windows.is_empty() {
+                ui.add_space(6.0);
+                widgets::section(ui, "Windows");
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for source in &windows {
+                        if widgets::pill_button(ui, &source.label, false).clicked() {
+                            action = Some(Action::ShareSource((*source).clone()));
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+            } else if cfg!(target_os = "macos") {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "A single window is not offered on macOS yet: ffmpeg can capture a display \
+                         and nothing smaller, and one window needs ScreenCaptureKit.",
+                    )
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+                );
+            }
+        });
+    if !open {
+        return Some(Action::CancelSharePicker);
+    }
     action
 }
 

@@ -27,7 +27,7 @@
 //! [BlackHole]: https://existential.audio/blackhole/
 
 use std::io::Read as _;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -123,7 +123,7 @@ fn macos_loopback() -> Option<Loopback> {
 
 #[cfg(target_os = "macos")]
 fn device_listing() -> Option<String> {
-    let output = Command::new("ffmpeg")
+    let output = super::ffmpeg::command()?
         .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -198,11 +198,11 @@ impl DesktopAudio {
         log::info!("screen: audio from {} — ffmpeg {}", loopback.label, args.join(" "));
         crate::diagnostics::note(&format!("screen: desktop audio from {}", loopback.label));
 
-        let mut child = Command::new("ffmpeg")
+        let mut child = super::ffmpeg::command()
+            .ok_or_else(|| anyhow!("{}", super::ffmpeg::advice()))?
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
             .spawn()
             .context("starting ffmpeg for desktop audio")?;
 

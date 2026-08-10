@@ -117,7 +117,11 @@ impl Default for VoiceSettings {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ScreenSettings {
-    /// Longest edge of the encoded picture, in pixels. The capture is scaled to fit.
+    /// Longest edge the picture may reach, in pixels.
+    ///
+    /// A *ceiling*, not a choice — and not shown in the settings screen. The share keeps its source's
+    /// own resolution; this only stops a 6K display being sent at a size no decoder will take. It
+    /// stays in the file so that somebody with a reason can lower it by hand.
     pub max_dimension: u32,
     pub fps: u32,
     pub kbps: u32,
@@ -127,10 +131,11 @@ pub struct ScreenSettings {
 
 impl Default for ScreenSettings {
     fn default() -> Self {
-        // 1080p60 at 8 Mbit/s. Chosen as a default that looks good on a LAN and does not
-        // saturate a typical home uplink; the settings screen goes considerably further
-        // in both directions, and nothing on the server objects.
-        ScreenSettings { max_dimension: 1920, fps: 60, kbps: 8_000, with_audio: true }
+        // The source's own resolution up to 4K, 60 frames a second, 8 Mbit/s. The bitrate is the one
+        // number that is a real choice: it looks good on a LAN and does not saturate a typical home
+        // uplink, and the settings screen goes considerably further in both directions with nothing on
+        // the server objecting.
+        ScreenSettings { max_dimension: 3_840, fps: 60, kbps: 8_000, with_audio: true }
     }
 }
 

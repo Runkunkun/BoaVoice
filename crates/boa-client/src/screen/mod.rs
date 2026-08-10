@@ -34,12 +34,14 @@
 //! rather than in a log.
 
 pub mod audio;
+pub mod ffmpeg;
 pub mod recv;
 pub mod send;
 
 pub use audio::{find_loopback, DesktopAudio, Loopback};
 pub use recv::{Frame, Watcher};
-pub use send::{ffmpeg_available, Share};
+pub use ffmpeg::available as ffmpeg_available;
+pub use send::{sources, Share, Source};
 
 /// The largest picture the sender will produce, whatever the settings say.
 ///
