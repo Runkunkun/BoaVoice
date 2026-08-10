@@ -405,7 +405,7 @@ at zero when the app does.
 cargo test
 ```
 
-227 of them: 134 in the client, 65 in the server, 28 in the protocol. The ones that earn their keep:
+240 of them: 147 in the client, 65 in the server, 28 in the protocol. The ones that earn their keep:
 
 - **`crates/boa-server/src/relay.rs`** runs the real relay over real UDP sockets: two people in a
   call hear each other, an unregistered stream is ignored, a forged registration cannot take over
@@ -413,6 +413,11 @@ cargo test
 - **`crates/boa-client/src/screen/recv.rs`** encodes two frames with openh264, fragments them the
   way the sender does, reassembles them the way the watcher does, and decodes them. If the packet
   format and the NAL grouping ever disagree, this is where it shows.
+- **`crates/boa-client/src/screen/mac/capture.rs`** captures the real screen with ScreenCaptureKit,
+  encodes it with the real hardware encoder, and decodes the result with **openh264** — the decoder
+  every watcher uses. Those two halves each work perfectly on their own, so if they disagreed about
+  H.264 profiles nothing else would notice: every share would simply be a black rectangle on
+  everybody else's machine.
 - **`crates/boa-client/src/audio/ring.rs`** runs a producer and a consumer on two threads and
   checks that every sample arrives exactly once and in order.
 - **`crates/boa-client/src/audio/denoise.rs`** pins the RNNoise scale conversion. RNNoise works on
