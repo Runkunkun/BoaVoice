@@ -437,8 +437,8 @@ at zero when the app does.
 cargo test
 ```
 
-181 in the client, 65 in the server, 28 in the protocol, plus two that run a whole screen share over
-real sockets. The ones that earn their keep:
+246 of them: 151 in the client, 65 in the server, 28 in the protocol, plus two that run a whole screen
+share over real sockets. The ones that earn their keep:
 
 - **`crates/boa-server/src/relay.rs`** runs the real relay over real UDP sockets: two people in a
   call hear each other, an unregistered stream is ignored, a forged registration cannot take over
