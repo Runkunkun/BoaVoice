@@ -48,6 +48,21 @@ pub enum ScreenAccess {
     Unknown,
 }
 
+/// Whether screen capture is allowed, without asking for anything.
+///
+/// Separate from [`request_screen_access`] because the two are wanted in different places: this one is
+/// for the log line at start-up, where showing a permission dialogue would be rude and where the answer
+/// is the single most useful thing to know when a share later fails.
+pub fn screen_access_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    // SAFETY: takes no arguments, returns a plain `bool`, present since 10.15.
+    unsafe {
+        CGPreflightScreenCaptureAccess()
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
 /// Check the permission, and ask for it if it has not been granted.
 ///
 /// Safe to call repeatedly: the preflight is cheap and the prompt is shown by the system at most once

@@ -35,6 +35,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BINARY = os.path.join(ROOT, "target", "release", "boavoice")
@@ -126,14 +127,7 @@ def main():
     with open(os.path.join(APP, "Contents", "Info.plist"), "wb") as handle:
         plistlib.dump(info_plist(app_version), handle)
 
-    # An ad-hoc signature. Unsigned bundles are refused outright on Apple silicon, and this
-    # is enough for a locally built app; a distributed one would need a real identity and
-    # notarisation.
-    signed = subprocess.run(
-        ["codesign", "--force", "--deep", "--sign", "-", APP],
-        capture_output=True,
-        text=True,
-    )
+    signed = sign(APP)
     if signed.returncode != 0:
         print(f"warning: codesign failed: {signed.stderr.strip()}", file=sys.stderr)
 
@@ -184,17 +178,76 @@ def install(bundle):
 
     # The signature covers paths, so re-sign in place at the new location. Moving a signed
     # bundle invalidates its signature, and macOS refuses to launch it.
-    subprocess.run(
-        ["codesign", "--force", "--deep", "--sign", "-", destination],
-        capture_output=True,
-        text=True,
-    )
+    sign(destination)
     print(f"→ installed to {destination}")
-    # The microphone permission is remembered per *bundle path and signature*, so a fresh
-    # install asks again. Worth saying, because "it stopped asking" and "it never asks" are
-    # both diagnosed as bugs.
-    print("note: macOS will ask for microphone access again after replacing the bundle")
+
+    forget_stale_permissions()
     return destination
+
+
+def sign(bundle):
+    """Ad-hoc, but with a designated requirement that names only the identifier.
+
+    Unsigned bundles are refused outright on Apple silicon, so *some* signature is required, and a
+    distributed app would need a real identity and notarisation. The `-r` is the part that matters
+    here, and it fixes a bug that looks exactly like a broken app:
+
+    **Privacy permissions are remembered against the app's designated requirement.** A plain ad-hoc
+    signature has no certificate to name, so its requirement falls back to the code hash — which
+    changes with every build. The visible result is that you grant screen recording, the app is
+    replaced, and the permission silently stops applying: System Settings still lists BoaVoice with
+    the switch on, and the app still cannot capture. Toggling the switch does not help, because the
+    stored requirement refers to a binary that no longer exists.
+
+    An explicit `identifier`-only requirement is satisfied by any build with the same identifier, so
+    one grant survives every rebuild. The trade is real and worth stating: it is a *weak* identity —
+    anything ad-hoc signed claiming `dev.boavoice.client` would inherit the permission. For a locally
+    built, unnotarised app that is the honest trade; a signed release would name its certificate here
+    instead.
+    """
+    # Through a file rather than inline: `codesign -r` takes a *path*, and a requirement passed as
+    # the next argument is read as a filename and reported as "No such file or directory".
+    with tempfile.NamedTemporaryFile("w", suffix=".req", delete=False) as handle:
+        handle.write(f'designated => identifier "{BUNDLE_ID}"\n')
+        requirement = handle.name
+    try:
+        return subprocess.run(
+            [
+                "codesign",
+                "--force",
+                "--deep",
+                "--sign",
+                "-",
+                "--identifier",
+                BUNDLE_ID,
+                "-r",
+                requirement,
+                bundle,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        os.unlink(requirement)
+
+
+def forget_stale_permissions():
+    """Drop the privacy grants tied to the *previous* build's code hash.
+
+    Only useful once — after this, the designated requirement above keeps a grant valid across
+    rebuilds — but without it the entry left over from an earlier install stays in place and keeps
+    failing, which is the state this whole arrangement exists to get out of. `tccutil reset` removes
+    permissions rather than granting any, so the worst case is being asked again.
+    """
+    for service in ("ScreenCapture", "Microphone"):
+        subprocess.run(
+            ["tccutil", "reset", service, BUNDLE_ID], capture_output=True, text=True
+        )
+    print(
+        "note: macOS will ask for the microphone and for screen recording once more — the grants\n"
+        "      from the previous build were tied to its code hash. After allowing them this time,\n"
+        "      restart the app once; later installs keep the permission."
+    )
 
 
 if __name__ == "__main__":

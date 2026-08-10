@@ -279,6 +279,14 @@ impl App {
             app.devices.inputs.len(),
             app.devices.outputs.len()
         ));
+        // Asked without prompting, and recorded here rather than only when a share fails. macOS grants
+        // this permission per binary *and* only to a process that started after it was granted, so
+        // "granted: false" in a log from a session that began before you allowed it is the expected
+        // answer rather than a fault — and this line is what makes the difference visible.
+        crate::diagnostics::note(&format!(
+            "screen: capture access granted to this process: {}",
+            crate::platform::screen_access_granted()
+        ));
         app
     }
 
