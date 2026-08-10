@@ -92,6 +92,11 @@ sensible to run in a container. Everything that survives a restart is in `/data`
 Behind a reverse proxy: point it at 8787 and let it terminate TLS. **Leave 8788/udp alone and
 publish it directly** — it carries voice and screens, and no HTTP proxy can carry UDP.
 
+One thing to do once, by hand: a package published to GitHub's registry starts **private** even
+when its repository is public, so the first `docker pull` from a server will ask for credentials.
+Open the package under the repository's *Packages*, and set its visibility to public — or keep it
+private and `docker login ghcr.io` on the server with a token that has `read:packages`.
+
 ## Getting the client
 
 Built apps for all three platforms are on the [releases

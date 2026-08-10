@@ -120,8 +120,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows
-      - name: nasm
-        run: choco install nasm -y
       - name: build
         run: cargo build --release --bin boavoice
       - name: collect
