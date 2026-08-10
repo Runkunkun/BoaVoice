@@ -16,6 +16,7 @@ pub mod connect;
 pub mod glass;
 pub mod icons;
 pub mod images;
+pub mod popout;
 pub mod settings_view;
 pub mod sidebar;
 pub mod transfers;
@@ -69,6 +70,8 @@ pub enum Action {
     ShareSource(crate::screen::Source),
     CancelSharePicker,
     StopScreen,
+    /// Move the screen being watched into a window of its own, or bring it back.
+    TogglePopOut,
     Watch(Id),
     Unwatch(Id),
     CreateChannel(String, ChannelKind),
@@ -199,6 +202,8 @@ pub struct App {
     preview: Option<crate::screen::Watcher>,
     /// The texture the watched screen is drawn from, with the frame number it came from.
     screen_texture: Option<(egui::TextureHandle, u64)>,
+    /// The shared screen in a window of its own, when somebody has asked for that.
+    popout: popout::PopOut,
     /// Whose picture that texture holds, so switching between two screens does not show the first
     /// one's last frame under the second one's name.
     texture_for: Option<Id>,
@@ -259,6 +264,7 @@ impl App {
             watcher: None,
             preview: None,
             screen_texture: None,
+            popout: popout::PopOut::default(),
             texture_for: None,
             transfers: crate::transfer::Transfers::spawn(cc.egui_ctx.clone()),
             active_transfers: Vec::new(),
@@ -751,6 +757,52 @@ impl App {
         }
     }
 
+    /// Hand the popped-out window this frame's picture, and notice when it has been closed.
+    ///
+    /// Called every frame rather than only on a change, because the *texture* changes every frame and
+    /// the window has no other way to reach it — it cannot borrow anything from here.
+    fn feed_popout(&mut self, ctx: &egui::Context) {
+        if !self.popout.open() {
+            return;
+        }
+        // Only a screen being watched can be popped out; leaving the view puts it back.
+        let View::Watching(target) = self.view else {
+            self.popout.close();
+            return;
+        };
+        let mine = self.state.me.as_ref().is_some_and(|me| me.id == target);
+        let whose = if mine { "Your own screen".to_string() } else { self.state.label(target) };
+
+        // The same line the in-app view shows, so a picture that is stuttering says why in whichever
+        // window somebody is looking at.
+        let trouble = self
+            .watcher
+            .as_ref()
+            .filter(|(who, _)| *who == target)
+            .and_then(|(_, watcher)| {
+                let frames = watcher.frames.load(std::sync::atomic::Ordering::Relaxed);
+                let dropped = watcher.dropped.load(std::sync::atomic::Ordering::Relaxed);
+                let attempted = frames + dropped;
+                let loss =
+                    dropped.checked_mul(100).and_then(|d| d.checked_div(attempted)).unwrap_or(0);
+                (loss > 20).then(|| format!("{loss}% of the picture is not arriving"))
+            });
+
+        self.popout.update(
+            self.screen_texture.as_ref().map(|(texture, _)| texture),
+            &whose,
+            trouble,
+        );
+        // Drawn here, and told to keep the frames coming: a deferred viewport is not repainted by the
+        // main window's repaints, so without this the popped-out picture would only move when something
+        // happened in the app.
+        if !self.popout.show(ctx) {
+            // Closed with its own button.
+            self.popout.close();
+        }
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("boa-screen-popout"));
+    }
+
     fn apply_user_volumes(&self) {
         let Some(session) = self.voice.as_ref() else { return };
         for state in self.state.voice.values() {
@@ -1121,6 +1173,18 @@ impl App {
                 self.view = View::Watching(user);
             }
 
+            Action::TogglePopOut => {
+                if self.popout.open() {
+                    self.popout.close();
+                } else {
+                    let View::Watching(target) = self.view else { return };
+                    let mine = self.state.me.as_ref().is_some_and(|me| me.id == target);
+                    let whose =
+                        if mine { "Your own screen".to_string() } else { self.state.label(target) };
+                    self.popout.open_for(whose);
+                }
+            }
+
             Action::Unwatch(_) => {
                 self.stop_watching();
                 self.view = self.state.my_channel().map(View::Channel).unwrap_or(View::Connect);
@@ -1231,6 +1295,7 @@ impl eframe::App for App {
         self.poll_voice(ctx);
         self.poll_screen(ctx);
         self.check_share();
+        self.feed_popout(ctx);
         self.images.collect(ctx);
         self.state.expire();
         self.notices.retain(|notice| !notice.expired());
@@ -1329,6 +1394,7 @@ impl eframe::App for App {
                             self.screen_texture.as_ref().map(|(texture, _)| texture),
                             self.watcher.as_ref().map(|(_, watcher)| watcher),
                             mine.then_some(self.share.as_ref()).flatten(),
+                            self.popout.open(),
                         ));
                     }
                     View::Channel(channel) => {
@@ -1460,6 +1526,7 @@ fn title_bar(
 }
 
 /// The screen-watching view.
+#[allow(clippy::too_many_arguments)]
 fn watching(
     ui: &mut egui::Ui,
     state: &State,
@@ -1467,6 +1534,9 @@ fn watching(
     texture: Option<&egui::TextureHandle>,
     watcher: Option<&crate::screen::Watcher>,
     own_share: Option<&crate::screen::Share>,
+    // Whether the picture is currently in a window of its own, which changes both what the button says
+    // and what is drawn in the space the picture would have taken.
+    popped_out: bool,
 ) -> Option<Action> {
     use std::sync::atomic::Ordering;
 
@@ -1495,6 +1565,16 @@ fn watching(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, icons::close, 26.0, "Close").clicked() {
                     action = Some(Action::Unwatch(user));
+                }
+                if widgets::icon_button(
+                    ui,
+                    icons::pop_out,
+                    26.0,
+                    if popped_out { "Bring it back into the app" } else { "Open in its own window" },
+                )
+                .clicked()
+                {
+                    action = Some(Action::TogglePopOut);
                 }
             });
         });
@@ -1593,10 +1673,33 @@ fn watching(
             if widgets::icon_button(ui, icons::close, 26.0, "Stop watching").clicked() {
                 action = Some(Action::Unwatch(user));
             }
+            if widgets::icon_button(
+                ui,
+                icons::pop_out,
+                26.0,
+                if popped_out { "Bring it back into the app" } else { "Open in its own window" },
+            )
+            .clicked()
+            {
+                action = Some(Action::TogglePopOut);
+            }
         });
     });
 
     let rect = ui.available_rect_before_wrap();
+    // Popped out: the picture is in the other window, and drawing it twice would upload nothing extra
+    // but would leave somebody wondering which one is live. Say where it went instead.
+    if popped_out {
+        glass::well(ui, rect, theme::R_PANEL);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "showing in its own window",
+            egui::FontId::proportional(12.0),
+            theme::TEXT_FAINT,
+        );
+        return action;
+    }
     match texture {
         Some(texture) => {
             // Fitted, letterboxed, and centred. Filling the panel instead would either stretch the

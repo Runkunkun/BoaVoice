@@ -134,6 +134,28 @@ pub fn monitor_share(painter: &egui::Painter, rect: Rect, colour: Color32) {
     painter.line_segment([tip, egui::pos2(tip.x + wing, tip.y + wing)], s);
 }
 
+/// A frame with an arrow leaving its corner: show this in a window of its own.
+pub fn pop_out(painter: &egui::Painter, rect: Rect, colour: Color32) {
+    let f = field(rect);
+    let s = stroke(f, colour);
+    // The frame, with its top-right corner left open for the arrow to leave through.
+    let frame = Rect::from_min_max(
+        egui::pos2(f.left(), f.top() + f.height() * 0.18),
+        egui::pos2(f.right() - f.width() * 0.18, f.bottom()),
+    );
+    painter.line_segment([frame.left_top(), frame.left_bottom()], s);
+    painter.line_segment([frame.left_bottom(), frame.right_bottom()], s);
+    painter.line_segment([frame.right_bottom(), egui::pos2(frame.right(), frame.center().y)], s);
+    painter.line_segment([frame.left_top(), egui::pos2(frame.center().x, frame.top())], s);
+    // The arrow, out through the corner.
+    let tip = egui::pos2(f.right(), f.top());
+    let tail = egui::pos2(f.center().x + f.width() * 0.02, f.center().y - f.height() * 0.02);
+    painter.line_segment([tail, tip], s);
+    let wing = f.width() * 0.26;
+    painter.line_segment([tip, egui::pos2(tip.x - wing, tip.y)], s);
+    painter.line_segment([tip, egui::pos2(tip.x, tip.y + wing)], s);
+}
+
 /// A gear, as a circle and a ring of teeth.
 pub fn gear(painter: &egui::Painter, rect: Rect, colour: Color32) {
     let f = field(rect);
