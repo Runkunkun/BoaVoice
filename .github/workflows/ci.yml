@@ -82,15 +82,14 @@ jobs:
           pkg-config --modversion opus || echo "no pkg-config opus — falling back to the source build"
           cmake --version || brew install cmake
 
-      # Windows has no pkg-config to find a libopus with, so `audiopus_sys` compiles it — and CMake 4,
-      # which the runners ship, refuses the vendored copy's `cmake_minimum_required(VERSION 3.1)`. 3.31
-      # accepts it with a deprecation warning, which is the difference between a green build and no
-      # Windows binary at all.
+      # Windows has no pkg-config to find a libopus with, so `audiopus_sys` compiles it from source with
+      # whatever CMake the runner ships. That is CMake 4, which refuses the vendored copy's
+      # `cmake_minimum_required(VERSION 3.1)` — hence `CMAKE_POLICY_VERSION_MINIMUM` at the top of this
+      # file. Pinning an older CMake instead does not work: one old enough to accept 3.1 is too old to
+      # know the runner's Visual Studio, and it fails printing its list of generators.
       - name: cmake (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          python -m pip install --upgrade "cmake==3.31.6"
-          cmake --version
+        run: cmake --version
 
       # Output is captured and, on failure, echoed back as workflow annotations. Without this the only
       # public record of a failed build is its exit code: the log itself needs admin rights to read

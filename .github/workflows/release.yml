@@ -69,6 +69,17 @@ jobs:
             python3 -m pip install --upgrade "cmake==3.31.6"
           cmake --version
 
+      # For the Apple-silicon build only, and that condition is the point: Homebrew's `libopus.a` is
+      # arm64, so `pkg-config` finding it is exactly right here and exactly wrong for the Intel build,
+      # which would try to link arm64 objects into an x86_64 binary. The Intel job falls through to the
+      # source build above, which cross-compiles properly. `OPUS_STATIC` means either way the library
+      # ends up *inside* the app, so a download depends on nothing the user has to install.
+      - name: libopus (Apple silicon)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          brew install pkg-config opus || brew upgrade pkg-config opus || true
+          pkg-config --modversion opus || echo "no pkg-config opus — falling back to the source build"
+
       - name: build
         run: cargo build --release --target ${{ matrix.target }} --bin boavoice
 
@@ -133,17 +144,21 @@ jobs:
   windows:
     runs-on: windows-latest
     name: Windows (.exe)
+    # **The one job allowed to fail.** Windows is the lowest priority here, and libopus is awkward to
+    # build on it: the runner's CMake 4 refuses the vendored copy's `cmake_minimum_required(VERSION
+    # 3.1)`, and pinning an older CMake trades that for a CMake too old to know the runner's Visual
+    # Studio. `CMAKE_POLICY_VERSION_MINIMUM` (set at the top of this file) is the way out that keeps the
+    # new CMake. If it stops working, a release with Mac and Linux downloads still beats no release, so
+    # this job does not hold the others up — and the notes below say when the .exe is missing.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows
-      # Pinned for the same reason as the macOS job: CMake 4 refuses the vendored opus outright.
       - name: cmake
-        run: |
-          python -m pip install --upgrade "cmake==3.31.6"
-          cmake --version
+        run: cmake --version
       - name: build
         run: cargo build --release --bin boavoice
       - name: collect
@@ -217,10 +232,15 @@ jobs:
 
           | Download | For |
           |---|---|
-          | \`BoaVoice-macOS-apple-silicon.zip\` | Macs with an M-series chip |
-          | \`BoaVoice-macOS-intel.zip\` | Intel Macs |
-          | \`BoaVoice-x86_64.AppImage\` | Linux (\`chmod +x\`, then run it) |
-          | \`BoaVoice.exe\` | Windows |
+          $(
+            # Only what actually built. The Windows job is allowed to fail, and a table promising an
+            # .exe that is not attached is worse than one that says it is missing.
+            row() { [ -n "$(find artifacts -name "$1" -print -quit)" ] && echo "| \`$1\` | $2 |"; }
+            row "BoaVoice-macOS-apple-silicon.zip" "Macs with an M-series chip"
+            row "BoaVoice-macOS-intel.zip" "Intel Macs"
+            row "BoaVoice-x86_64.AppImage" "Linux (\`chmod +x\`, then run it)"
+            row "BoaVoice.exe" "Windows"
+          )
 
           ### macOS: the first launch needs one command
 
@@ -250,11 +270,15 @@ jobs:
           **Publish both ports.** The UDP one carries voice and screens and cannot go through an HTTP
           reverse proxy; without it chat works perfectly and nobody can hear anybody.
 
-          ### Sharing a screen needs ffmpeg
+          ### Screen sharing
 
-          Watching one does not. \`brew install ffmpeg\`, \`apt install ffmpeg\`, or
-          \`winget install Gyan.FFmpeg\`. Sharing the machine's *sound* also needs a loopback device
-          on macOS and Windows — \`cargo run --example loopbackcheck\` says what is missing.
+          **On macOS, nothing to install.** The capture is ScreenCaptureKit and the encoder is
+          VideoToolbox, both part of the system, and the machine's own sound comes with the picture —
+          with this app's audio excluded, so nobody in the call hears themselves. Needs macOS 13.
+
+          On Linux and Windows, *sharing* needs ffmpeg (\`apt install ffmpeg\`,
+          \`winget install Gyan.FFmpeg\`); watching never does. Sharing the machine's sound there also
+          needs a loopback device — \`cargo run --example loopbackcheck\` says what is missing.
           EOF
           cat notes.md
 
@@ -263,4 +287,5 @@ jobs:
           name: BoaVoice ${{ github.ref_name }}
           body_path: notes.md
           files: artifacts/**/*
-          fail_on_unmatched_files: true
+          # False, because the Windows job is allowed to fail and its artefact may simply not exist.
+          fail_on_unmatched_files: false
