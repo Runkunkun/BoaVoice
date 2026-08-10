@@ -68,11 +68,14 @@ pub struct Encoder {
     /// Where finished pictures wait, when this encoder keeps them itself. `None` when the caller gave
     /// it somewhere else to put them — see [`Encoder::sending_to`].
     pictures: Option<Receiver<Picture>>,
-    /// Frame index, which becomes the presentation timestamp. VideoToolbox needs timestamps to be
-    /// increasing and otherwise does not care what they mean.
-    frame: i64,
     fps: u32,
 }
+
+// SAFETY: an `Encoder` is a Core Foundation session plus a `Box` this type owns. Both may be used from
+// any thread; what must not happen is two threads using them at once, and every path to an `Encoder`
+// goes through a `Mutex`. This is needed because the capture side hands frames in from ScreenCaptureKit's
+// queue and from the heartbeat thread.
+unsafe impl Send for Encoder {}
 
 impl Encoder {
     /// Start an encoder for a picture of this size, keeping its output for [`Encoder::take`].
@@ -134,7 +137,7 @@ impl Encoder {
         // SAFETY: `create` returned a retained session.
         let session = unsafe { CFRetained::from_raw(NonNull::new_unchecked(out)) };
 
-        let encoder = Encoder { session, sink, pictures: None, frame: 0, fps: fps.max(1) };
+        let encoder = Encoder { session, sink, pictures: None, fps: fps.max(1) };
         encoder.configure(kbps)?;
         log::info!("screen: VideoToolbox encoder {width}×{height} at {fps} fps, {kbps} kbit/s");
         Ok(encoder)
@@ -186,27 +189,35 @@ impl Encoder {
         }
     }
 
-    /// Hand one captured frame to the encoder.
+    /// Hand one captured frame to the encoder, stamped with when it was captured.
     ///
     /// Returns as soon as the frame is queued; the encoded picture arrives later, on the encoder's own
     /// thread, and is collected with [`Encoder::take`].
-    pub fn encode(&mut self, image: &CVImageBuffer, force_keyframe: bool) -> Result<()> {
-        // A timescale of the frame rate and a timestamp of the frame number: the encoder only needs
-        // these to increase, and deriving them from the frame count rather than from the clock means a
-        // late frame does not look like a rate change.
+    ///
+    /// `at` is time since the capture began, and it is **wall-clock time rather than a frame count** for
+    /// one specific reason: the encoder's "a keyframe at least every two seconds" rule is measured in
+    /// presentation time. Numbering the frames 0, 1, 2… makes that rule mean "every two seconds *of
+    /// frames*", so a screen that only changes twice a second would go a minute between keyframes — and
+    /// somebody joining that share would stare at nothing for the whole minute.
+    pub fn encode(
+        &mut self,
+        image: &CVImageBuffer,
+        force_keyframe: bool,
+        at: std::time::Duration,
+    ) -> Result<()> {
+        // Microseconds, which is finer than any capture rate and still nowhere near overflowing an i64.
         let timestamp = CMTime {
-            value: self.frame,
-            timescale: self.fps as i32,
+            value: at.as_micros() as i64,
+            timescale: 1_000_000,
             flags: objc2_core_media::CMTimeFlags::Valid,
             epoch: 0,
         };
         let duration = CMTime {
-            value: 1,
-            timescale: self.fps as i32,
+            value: (1_000_000 / self.fps.max(1)) as i64,
+            timescale: 1_000_000,
             flags: objc2_core_media::CMTimeFlags::Valid,
             epoch: 0,
         };
-        self.frame += 1;
 
         let properties = if force_keyframe {
             // SAFETY: the key is a framework constant and takes a boolean.
@@ -504,7 +515,9 @@ mod tests {
             CVPixelBufferUnlockBaseAddress(&pixels, CVPixelBufferLockFlags::empty());
         }
 
-        encoder.encode(&pixels, true).expect("the frame should be accepted");
+        encoder
+            .encode(&pixels, true, std::time::Duration::ZERO)
+            .expect("the frame should be accepted");
 
         // The callback is asynchronous, so wait for it rather than assuming.
         let mut picture = None;

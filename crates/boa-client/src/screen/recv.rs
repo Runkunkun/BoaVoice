@@ -12,6 +12,24 @@
 //! the next keyframe because each subsequent frame builds on the broken one. Waiting costs at most
 //! the keyframe interval, and it is the difference between "the picture appears in a moment" and "the
 //! picture is broken".
+//!
+//! # Where the queue goes, and why it matters
+//!
+//! Fragments are reassembled **in the network thread**, and the queue between it and the decoder
+//! carries whole pictures. Putting the queue the other way round — fragments in, reassembly in the
+//! decoder — reads as the same thing and is not, because the two ends behave completely differently
+//! when the queue overflows:
+//!
+//! * A queue of **fragments** that overflows loses arbitrary pieces of whichever pictures happened to
+//!   be arriving. Every picture missing a piece is a picture that never completes. And a keyframe is
+//!   *large* — measured at 115 KB, a hundred datagrams, for a 1080p share — so a queue deep enough for
+//!   several delta frames is not deep enough for one keyframe. Once the decoder falls a fraction of a
+//!   second behind, no keyframe can ever be completed again, and the picture is gone for good.
+//! * A queue of **pictures** that overflows drops whole pictures, which is exactly what should happen:
+//!   the stream stays decodable, and a decoder that cannot keep up simply shows fewer frames.
+//!
+//! This was not a theoretical concern. It is the bug that made a share stop after the first few frames
+//! and never recover.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,18 +46,70 @@ use openh264::formats::YUVSource as _;
 /// have started is not going to be completed.
 const IN_FLIGHT: usize = 2;
 
-/// Where a decoder gets its pictures.
+/// How many whole pictures may wait for the decoder.
 ///
-/// Two sources, because there are two reasons to decode H.264 here. Watching somebody else means
-/// reassembling fragments that arrived over UDP and may be missing pieces. Watching **your own**
-/// share means taking the pictures straight from the encoder, before they are cut up — nothing can be
-/// lost, and there is no relay in between: the relay never sends a stream back to whoever sent it, so
-/// a local preview is the only way to see what everybody else is seeing.
-pub enum Feed {
-    /// Fragments from the media socket, for one sender's stream id.
-    Fragments(std::sync::mpsc::Receiver<(PacketHeader, Vec<u8>)>, u32),
-    /// Whole pictures from this machine's own encoder, with their keyframe flag.
-    Pictures(std::sync::mpsc::Receiver<(bool, Vec<u8>)>),
+/// Four. Enough that a decoder which stalls for a frame catches up; few enough that one which stalls
+/// for a second does not accumulate a backlog it would then show late. Overflow drops the *newest*
+/// arrival, which is the wrong one to lose in theory and the right one in practice: dropping the oldest
+/// would mean re-ordering a stream whose pictures must be decoded in order.
+const QUEUE: usize = 4;
+
+/// One picture on its way to the decoder: whether it is a keyframe, and its bytes.
+type Picture = (bool, Vec<u8>);
+
+/// Where a decoder gets its pictures — always whole ones, from one of two places.
+///
+/// Watching somebody else means pictures reassembled from UDP fragments by [`Tap`], which may be
+/// missing some. Watching **your own** share means pictures straight from the encoder, before they are
+/// cut up: nothing can be lost, and there is no relay in between — the relay never sends a stream back
+/// to whoever sent it, so a local preview is the only way to see what everybody else is seeing.
+pub struct Feed(std::sync::mpsc::Receiver<Picture>);
+
+/// The network thread's end of a share being watched.
+///
+/// Holds the reassembly state, so a fragment costs one `memcpy` on that thread and the decoder is
+/// handed something it can always decode. Lives behind the media session's lock, which is why it is a
+/// type of its own rather than a bare channel.
+pub struct Tap {
+    pictures: std::sync::mpsc::SyncSender<Picture>,
+    assembler: Reassembler,
+    /// Whose stream this is. The relay only forwards streams we subscribed to, but a share that has
+    /// just been swapped for another can still have packets in flight.
+    ssrc: u32,
+    /// Pictures that never arrived whole, plus those dropped because the decoder was behind. Shown in
+    /// the interface: "it stopped" and "you are losing a third of the packets" want different answers.
+    dropped: Arc<AtomicU64>,
+}
+
+impl Tap {
+    /// The two ends of a watch without a decoder between them.
+    ///
+    /// Separated out because it is the seam the tests need: a decoder thread drains the queue as fast as
+    /// it can, which is exactly what makes an overflow bug invisible.
+    fn pair(
+        ssrc: u32,
+        depth: usize,
+    ) -> (Tap, std::sync::mpsc::Receiver<Picture>, Arc<AtomicU64>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(depth);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let tap =
+            Tap { pictures: tx, assembler: Reassembler::default(), ssrc, dropped: dropped.clone() };
+        (tap, rx, dropped)
+    }
+
+    /// Take one media packet. Complete pictures go to the decoder; the rest is bookkeeping.
+    pub fn feed(&mut self, header: &PacketHeader, payload: &[u8]) {
+        if header.ssrc != self.ssrc || !header.kind.is_video() {
+            return;
+        }
+        let Some(picture) = self.assembler.feed(header, payload, &self.dropped) else { return };
+        let keyframe = header.kind == MediaKind::VideoKey;
+        // `try_send`, because this is the network thread: blocking here would stall voice as well, and
+        // a picture the decoder has no room for is a picture already out of date.
+        if self.pictures.try_send((keyframe, picture)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A decoded picture, ready to become a texture.
@@ -60,6 +130,11 @@ pub struct Watcher {
     thread: Option<std::thread::JoinHandle<()>>,
     pub frames: Arc<AtomicU64>,
     pub dropped: Arc<AtomicU64>,
+    /// Pictures the decoder *refused*, which is a different fault from a picture that never arrived
+    /// whole. Loss means the network or a slow decoder; a refusal means the bytes were wrong — a
+    /// fragment stitched into the wrong place, a parameter set missing. One is weather, the other is a
+    /// bug, and counting them together hides the bug.
+    pub failed: Arc<AtomicU64>,
     /// Set once a keyframe has been decoded, so the interface can say "waiting for a keyframe"
     /// rather than showing an empty box.
     pub started: Arc<AtomicBool>,
@@ -70,25 +145,27 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Start decoding whatever arrives on `packets`.
+    /// Start watching somebody's share: a [`Tap`] for the network thread and a decoder for the picture.
     ///
-    /// The channel is fed by the media receive thread, which drops video when this queue is full —
-    /// the right behaviour, since a decoder that has fallen behind wants the newest picture and not a
-    /// backlog of old ones.
-    pub fn start(packets: std::sync::mpsc::Receiver<(PacketHeader, Vec<u8>)>, ssrc: u32) -> Watcher {
-        Watcher::feed(Feed::Fragments(packets, ssrc))
+    /// The two halves share the dropped counter, because the drop can happen at either end — a fragment
+    /// that never arrived, or a picture the decoder had no room for — and to somebody watching a frozen
+    /// picture they mean the same thing.
+    pub fn start(ssrc: u32) -> (Tap, Watcher) {
+        let (tap, pictures, dropped) = Tap::pair(ssrc, QUEUE);
+        let watcher = Watcher::feed(Feed(pictures), dropped);
+        (tap, watcher)
     }
 
     /// Decode this machine's own share, for a preview of what is going out.
-    pub fn preview(pictures: std::sync::mpsc::Receiver<(bool, Vec<u8>)>) -> Watcher {
-        Watcher::feed(Feed::Pictures(pictures))
+    pub fn preview(pictures: std::sync::mpsc::Receiver<Picture>) -> Watcher {
+        Watcher::feed(Feed(pictures), Arc::new(AtomicU64::new(0)))
     }
 
-    fn feed(source: Feed) -> Watcher {
+    fn feed(source: Feed, dropped: Arc<AtomicU64>) -> Watcher {
+        let failed = Arc::new(AtomicU64::new(0));
         let latest = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
-        let dropped = Arc::new(AtomicU64::new(0));
         let started = Arc::new(AtomicBool::new(false));
 
         let thread = {
@@ -109,7 +186,16 @@ impl Watcher {
                 .expect("spawning a thread")
         };
 
-        Watcher { latest, stop, thread: Some(thread), frames, dropped, started, since: std::time::Instant::now() }
+        Watcher {
+            latest,
+            stop,
+            thread: Some(thread),
+            frames,
+            dropped,
+            failed,
+            started,
+            since: std::time::Instant::now(),
+        }
     }
 
     /// Take the latest picture, if there is one newer than `seen`.
@@ -142,30 +228,16 @@ fn decode_loop(
     latest: &Mutex<Option<Frame>>,
     stop: &AtomicBool,
     frames: &AtomicU64,
-    dropped: &AtomicU64,
+    failed: &AtomicU64,
     started: &AtomicBool,
 ) -> Result<()> {
     let mut decoder = openh264::decoder::Decoder::new().context("starting the H.264 decoder")?;
-    let mut assembler = Reassembler::default();
     let mut generation = 0u64;
 
     while !stop.load(Ordering::Acquire) {
         // Blocking: the thread has nothing else to do, and the channel closing is how it learns the
         // share has ended.
-        let (keyframe, picture) = match &source {
-            Feed::Fragments(packets, ssrc) => {
-                let Ok((header, payload)) = packets.recv() else { return Ok(()) };
-                if header.ssrc != *ssrc || !header.kind.is_video() {
-                    continue;
-                }
-                let Some(picture) = assembler.feed(&header, &payload, dropped) else { continue };
-                (header.kind == MediaKind::VideoKey, picture)
-            }
-            Feed::Pictures(pictures) => match pictures.recv() {
-                Ok(picture) => picture,
-                Err(_) => return Ok(()),
-            },
-        };
+        let Ok((keyframe, picture)) = source.0.recv() else { return Ok(()) };
 
         // Until a keyframe has been seen, a delta has no reference and decoding it produces the
         // familiar smear rather than a picture.
@@ -194,7 +266,7 @@ fn decode_loop(
             Ok(None) => {}
             Err(err) => {
                 log::debug!("screen: decode: {err}");
-                dropped.fetch_add(1, Ordering::Relaxed);
+                failed.fetch_add(1, Ordering::Relaxed);
                 // A failed decode means the reference chain is broken; wait for the next keyframe
                 // rather than feeding it more deltas it cannot use.
                 started.store(false, Ordering::Release);
@@ -298,6 +370,69 @@ mod tests {
 
     fn header(timestamp: u32, seq: u32) -> PacketHeader {
         PacketHeader { kind: MediaKind::VideoKey, ssrc: 1, seq, timestamp }
+    }
+
+    /// **The bug this file's header is about.** A keyframe is far bigger than the queue is deep, and
+    /// with the queue on the wrong side of the reassembler that made it impossible to assemble one:
+    /// measured at 102 datagrams for a 1080p share against a queue of 120 packets, so the first stall
+    /// killed the picture permanently. Reassembled here, a picture of any size is one queue slot.
+    #[test]
+    fn a_keyframe_far_larger_than_the_queue_still_arrives_whole() {
+        // 200 fragments — nearly twice what the old fragment queue could hold, and a realistic size for
+        // a keyframe of a busy 1080p screen.
+        let picture: Vec<u8> = (0..200 * MAX_VIDEO_CHUNK as u32).map(|i| i as u8).collect();
+        let (mut tap, pictures, dropped) = Tap::pair(7, QUEUE);
+
+        let payloads = packets(&picture);
+        assert!(payloads.len() > QUEUE * 10, "the test needs a picture much larger than the queue");
+        for (i, payload) in payloads.iter().enumerate() {
+            tap.feed(&PacketHeader { kind: MediaKind::VideoKey, ssrc: 7, seq: i as u32, timestamp: 1 }, payload);
+        }
+
+        let (keyframe, arrived) = pictures.try_recv().expect("one whole picture");
+        assert!(keyframe);
+        assert_eq!(arrived, picture, "the picture came back changed");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    /// And when the decoder cannot keep up, what is lost is whole pictures rather than pieces of them.
+    /// The distinction is the whole point: a queue that sheds fragments corrupts *every* picture,
+    /// including the keyframes a stream needs to recover.
+    #[test]
+    fn an_overflowing_queue_loses_whole_pictures_not_pieces_of_them() {
+        let (mut tap, pictures, dropped) = Tap::pair(7, QUEUE);
+
+        // Nothing drains the queue, so everything past its depth has to go somewhere.
+        let sent = QUEUE + 5;
+        for n in 0..sent {
+            let picture: Vec<u8> = (0..3_000u32).map(|i| (i as u8).wrapping_add(n as u8)).collect();
+            for (i, payload) in packets(&picture).iter().enumerate() {
+                let header = PacketHeader {
+                    kind: MediaKind::VideoDelta,
+                    ssrc: 7,
+                    seq: (n * 10 + i) as u32,
+                    timestamp: n as u32 + 1,
+                };
+                tap.feed(&header, payload);
+            }
+        }
+
+        // Whatever is in the queue is intact: every picture is the length it was sent at, and its bytes
+        // are the ones its sender produced.
+        let mut received = 0;
+        while let Ok((_, picture)) = pictures.try_recv() {
+            assert_eq!(picture.len(), 3_000, "a picture arrived in pieces");
+            let n = picture[0];
+            let expected: Vec<u8> = (0..3_000u32).map(|i| (i as u8).wrapping_add(n)).collect();
+            assert_eq!(picture, expected, "a picture arrived mixed up with another");
+            received += 1;
+        }
+        assert_eq!(received, QUEUE, "the queue should be full");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed) as usize,
+            sent - QUEUE,
+            "every picture that did not fit should be counted"
+        );
     }
 
     /// Fragment a picture the way the sender does, and return the payloads.

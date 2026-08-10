@@ -76,7 +76,12 @@ fn capture(wanted: &str) {
     };
 
     println!();
-    let mut capture = match Capture::start(target, 1920, 1080, 30, 4_000, true) {
+    // The user's own settings, so the numbers below are the ones that matter rather than a demo's.
+    let settings = boa_client::settings::Settings::load().screen;
+    let (cap_w, cap_h) = (settings.max_dimension, (settings.max_dimension * 9 / 16).max(2));
+    println!("settings: up to {cap_w}×{cap_h}, {} fps, {} kbit/s", settings.fps, settings.kbps);
+    let mut capture =
+        match Capture::start(target, cap_w, cap_h, settings.fps, settings.kbps, true) {
         Ok(capture) => capture,
         Err(err) => {
             println!("could not capture: {err:#}");
@@ -88,6 +93,8 @@ fn capture(wanted: &str) {
     let sound = capture.sound();
 
     let (mut pictures, mut keyframes, mut bytes) = (0u64, 0u64, 0usize);
+    let (mut biggest_key, mut biggest_delta) = (0usize, 0usize);
+    let (mut most_key_fragments, mut most_delta_fragments) = (0usize, 0usize);
     let (mut buffers, mut samples, mut peak) = (0u64, 0usize, 0.0f32);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
@@ -105,6 +112,14 @@ fn capture(wanted: &str) {
                 pictures += 1;
                 keyframes += u64::from(picture.keyframe);
                 bytes += picture.data.len();
+                let fragments = picture.data.len().div_ceil(boa_proto::media::MAX_VIDEO_CHUNK);
+                if picture.keyframe {
+                    biggest_key = biggest_key.max(picture.data.len());
+                    most_key_fragments = most_key_fragments.max(fragments);
+                } else {
+                    biggest_delta = biggest_delta.max(picture.data.len());
+                    most_delta_fragments = most_delta_fragments.max(fragments);
+                }
             }
             None => std::thread::sleep(Duration::from_millis(2)),
         }
@@ -117,6 +132,12 @@ fn capture(wanted: &str) {
         pictures as f64 / seconds
     );
     println!("frames delivered by the window server: {}", capture.frames());
+    println!(
+        "biggest keyframe: {} KB in {most_key_fragments} datagrams; \
+         biggest delta: {} KB in {most_delta_fragments}",
+        biggest_key / 1024,
+        biggest_delta / 1024
+    );
 
     if sound.is_some() {
         println!(

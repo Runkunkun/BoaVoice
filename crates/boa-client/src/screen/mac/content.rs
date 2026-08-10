@@ -158,6 +158,10 @@ pub fn sources() -> Result<Vec<Source>, String> {
             continue;
         }
 
+        // The bundle identifier, at debug level, because the filter above is a list of identifiers and
+        // the only way to extend it is to know what something calls itself. `RUST_LOG=debug` and the
+        // window nobody wants offered names itself.
+        log::debug!("screen: offering window {id} {bundle:?} {title:?} {width}×{height}");
         windows.push((
             width * height,
             Source { input: format!("window:{id}"), label: format!("{app} — {title}"), window: true },
@@ -178,11 +182,17 @@ pub fn sources() -> Result<Vec<Source>, String> {
 /// of them through. Every one of these appears in the window list on a stock machine, and not one of
 /// them is something somebody means to share.
 fn is_furniture(bundle: &str) -> bool {
-    const DESKTOP: [&str; 8] = [
+    const DESKTOP: [&str; 10] = [
         "com.apple.dock",
         "com.apple.notificationcenterui",
         "com.apple.WindowManager",
         "com.apple.wallpaper",
+        // The agent that draws the desktop picture. It owns a full-screen window called "Offscreen
+        // Wallpaper Window" which is, as the name says, offscreen — `isOnScreen` reports it as visible
+        // anyway, so the size and title filters do not catch it. Being the largest window on the machine
+        // it sorted straight to the top of the list, and capturing it produces no frames at all.
+        "com.apple.wallpaper.agent",
+        "com.apple.WallpaperAgent",
         "com.apple.controlcenter",
         "com.apple.systemuiserver",
         "com.apple.WindowServer",
@@ -332,6 +342,9 @@ mod tests {
         // A near-miss must not match: this is an equality test, not a prefix one, because
         // `com.apple.dockextra` would be somebody's utility.
         assert!(!is_furniture("com.apple.dock.extra"));
+        // The wallpaper agent, which is not the same identifier as the wallpaper framework and had to be
+        // listed separately: it owns the biggest window on the machine and captures to nothing.
+        assert!(is_furniture("com.apple.wallpaper.agent"));
     }
 
     #[test]
@@ -359,8 +372,10 @@ mod tests {
                     assert!(!source.label.is_empty());
                     assert!(target(source).is_some(), "{:?} is not addressable", source.input);
                 }
-                // A machine with a display always has at least that.
-                assert!(found.iter().any(|source| !source.window) || found.is_empty());
+                // No assertion that a screen is among them, and that is a finding rather than a
+                // weakening: **ScreenCaptureKit reports no displays at all while the display is
+                // asleep**, while still listing every window. A machine left alone for ten minutes is
+                // in that state, so a test insisting on a screen fails at night and passes by day.
             }
             Err(why) => {
                 assert!(!why.is_empty());

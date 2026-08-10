@@ -28,6 +28,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
@@ -36,6 +37,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_video::CVImageBuffer;
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput,
@@ -61,7 +63,9 @@ const DEPTH: isize = 5;
 pub struct Capture {
     stream: Retained<SCStream>,
     /// The delegate. Held because the framework does *not* retain it — an output object that goes out of
-    /// scope here is a stream that stops delivering, silently.
+    /// scope here is a stream that stops delivering, silently. Never read, and that is the point: it
+    /// exists to stay alive.
+    #[allow(dead_code)]
     output: Retained<Output>,
     /// Where finished pictures arrive. Taken out by [`Capture::pictures`] so the sending thread can
     /// wait on it rather than poll — after which [`Capture::take`] has nothing to give.
@@ -70,6 +74,9 @@ pub struct Capture {
     sound: Option<Receiver<Vec<f32>>>,
     frames: Arc<AtomicU64>,
     trouble: Arc<Mutex<Option<String>>>,
+    /// The shared encoder state, kept so a keyframe can be asked for and the heartbeat stopped.
+    beat: Arc<Heartbeat>,
+    heart: Option<std::thread::JoinHandle<()>>,
     /// The size the stream was configured at, which is what the far side is told to expect.
     pub width: u32,
     pub height: u32,
@@ -103,6 +110,17 @@ impl Capture {
 
         let frames = Arc::new(AtomicU64::new(0));
         let trouble = Arc::new(Mutex::new(None));
+        let beat = Arc::new(Heartbeat {
+            encoder: Mutex::new(encoder),
+            last: Mutex::new(None),
+            fed: Mutex::new(Instant::now()),
+            began: Instant::now(),
+            frames: frames.clone(),
+            // The first frame: a stream whose first picture is not a keyframe is a stream nobody can
+            // start watching.
+            keyframe: std::sync::atomic::AtomicBool::new(true),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
 
         // The sound, when it was asked for: a channel of interleaved stereo, which is what the Opus
         // encoder on the other end of it wants. A shallow queue — a share whose sound is a second
@@ -113,7 +131,7 @@ impl Capture {
         } else {
             (None, None)
         };
-        let output = Output::new(encoder, frames.clone(), trouble.clone(), sound_tx);
+        let output = Output::new(beat.clone(), trouble.clone(), sound_tx);
 
         let filter = filter(&located);
         let configuration = configure(width, height, fps, sound);
@@ -180,6 +198,16 @@ impl Capture {
             "screen: ScreenCaptureKit {width}×{height} at {fps} fps"
         ));
 
+        // The heartbeat, started only once the stream is running so it does not send a frame into a
+        // capture that failed.
+        let heart = {
+            let beat = beat.clone();
+            std::thread::Builder::new()
+                .name("boa-screen-heartbeat".into())
+                .spawn(move || keep_alive(&beat))
+                .context("spawning the screen heartbeat")?
+        };
+
         Ok(Capture {
             stream,
             output,
@@ -187,6 +215,8 @@ impl Capture {
             sound: sound_rx,
             frames,
             trouble,
+            beat,
+            heart: Some(heart),
             width,
             height,
         })
@@ -226,12 +256,40 @@ impl Capture {
 
     /// Ask for a keyframe on the next frame, so somebody who has just joined can start decoding.
     pub fn want_keyframe(&self) {
-        self.output.ivars().keyframe.store(true, Ordering::Release);
+        self.beat.keyframe.store(true, Ordering::Release);
+    }
+}
+
+/// Re-send the last frame while nothing is changing.
+///
+/// The encoder's own rules then apply to it: a repeat encodes to a few hundred bytes, and its
+/// "keyframe at least every two seconds" limit — measured in the wall-clock timestamps
+/// [`Encoder::encode`] is given — means a still share becomes watchable within two seconds of somebody
+/// joining, instead of never.
+fn keep_alive(beat: &Heartbeat) {
+    while !beat.stop.load(Ordering::Acquire) {
+        std::thread::sleep(HEARTBEAT / 4);
+        if beat.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let idle = beat.fed.lock().map(|fed| fed.elapsed()).unwrap_or_default();
+        if idle < HEARTBEAT {
+            continue;
+        }
+        // Cloned out of the lock before encoding: `feed` takes the encoder's lock, and holding two is
+        // how a deadlock is written.
+        let last = beat.last.lock().ok().and_then(|last| last.as_ref().map(|i| i.0.clone()));
+        let Some(image) = last else { continue };
+        beat.feed(&image, false);
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.beat.stop.store(true, Ordering::Release);
+        if let Some(heart) = self.heart.take() {
+            let _ = heart.join();
+        }
         // Synchronous on purpose. The screen-recording indicator in the menu bar stays lit until the
         // stream is actually stopped, and an asynchronous stop would leave it lit for as long as it took
         // — which reads as "this app is still watching you".
@@ -359,16 +417,69 @@ fn fit(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
 // The delegate
 // --------------------------------------------------------------------------- //
 
-/// What the delegate holds on to.
-pub struct Ivars {
-    /// The encoder, behind a lock because the framework owns the thread it is used from. The queue is
-    /// serial, so this is never contended in practice — it is here to make the sharing legal rather
-    /// than to arbitrate it.
+/// How long a still screen may go without producing anything.
+///
+/// **The reason this exists at all:** ScreenCaptureKit delivers a frame when the screen *changes*, and
+/// nothing whatsoever when it does not. A share of a window that is sitting still therefore sends no
+/// packets — so somebody who starts watching it sees "waiting for a keyframe" and keeps seeing it, for
+/// as long as nobody moves anything. That is not a rare case; it is a slide, a document, a paused video.
+///
+/// Half a second. The re-sent frame is identical to the last one, which H.264 encodes to a few hundred
+/// bytes, and it lets the encoder's own two-second keyframe rule do the rest.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The encoder and the last thing given to it, shared between the framework's queue and the heartbeat.
+///
+/// One `Arc` rather than state in the delegate's ivars, because the heartbeat runs on a thread of its
+/// own and an Objective-C object is not the thing to send there.
+struct Heartbeat {
+    /// The encoder, behind a lock because two threads feed it: ScreenCaptureKit's queue and the
+    /// heartbeat. Contention is a few microseconds twice a second.
     encoder: Mutex<Encoder>,
+    /// The last frame the window server delivered, kept so it can be sent again. This is the only
+    /// reason a still share keeps working.
+    last: Mutex<Option<Image>>,
+    /// When something was last handed to the encoder — by either thread.
+    fed: Mutex<Instant>,
+    /// When the capture began, which is what encoder timestamps are measured from.
+    began: Instant,
     frames: Arc<AtomicU64>,
-    trouble: Arc<Mutex<Option<String>>>,
     /// Set when the next frame should be a keyframe, cleared when it has been asked for.
     keyframe: std::sync::atomic::AtomicBool,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// A captured frame that can be held across threads.
+///
+/// `CVImageBuffer` is a Core Video object: retaining, releasing and reading one from another thread is
+/// allowed, and reading is all that happens here — the encoder copies what it needs. The wrapper exists
+/// because that guarantee is Apple's documentation rather than something the bindings express.
+struct Image(CFRetained<CVImageBuffer>);
+
+// SAFETY: see [`Image`] — the buffer is read-only from here on, and access is serialised by the `Mutex`
+// it lives in.
+unsafe impl Send for Image {}
+
+impl Heartbeat {
+    /// Hand a frame to the encoder and note the time.
+    fn feed(&self, image: &CVImageBuffer, force_keyframe: bool) {
+        let at = self.began.elapsed();
+        let Ok(mut encoder) = self.encoder.lock() else { return };
+        match encoder.encode(image, force_keyframe, at) {
+            Ok(()) => {
+                if let Ok(mut fed) = self.fed.lock() {
+                    *fed = Instant::now();
+                }
+            }
+            Err(err) => log::debug!("screen: {err:#}"),
+        }
+    }
+}
+
+/// What the delegate holds on to.
+pub struct Ivars {
+    beat: Arc<Heartbeat>,
+    trouble: Arc<Mutex<Option<String>>>,
     /// Where the machine's sound goes. Reached from the audio queue, which is a different thread from
     /// the video one — hence a channel rather than shared state.
     sound: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
@@ -410,14 +521,14 @@ define_class!(
                 return;
             };
 
-            let ivars = self.ivars();
-            let force = ivars.keyframe.swap(false, Ordering::AcqRel);
-            let Ok(mut encoder) = ivars.encoder.lock() else { return };
-            match encoder.encode(&image, force) {
-                Ok(()) => {
-                    ivars.frames.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(err) => log::debug!("screen: {err:#}"),
+            let beat = &self.ivars().beat;
+            let force = beat.keyframe.swap(false, Ordering::AcqRel);
+            beat.frames.fetch_add(1, Ordering::Relaxed);
+            beat.feed(&image, force);
+            // Kept for the heartbeat to send again if the screen goes quiet. Stored after encoding, so a
+            // slow encoder never delays the frame it was given.
+            if let Ok(mut last) = beat.last.lock() {
+                *last = Some(Image(image));
             }
         }
     }
@@ -539,20 +650,11 @@ impl Output {
     }
 
     fn new(
-        encoder: Encoder,
-        frames: Arc<AtomicU64>,
+        beat: Arc<Heartbeat>,
         trouble: Arc<Mutex<Option<String>>>,
         sound: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
     ) -> Retained<Output> {
-        let this = Output::alloc().set_ivars(Ivars {
-            encoder: Mutex::new(encoder),
-            frames,
-            trouble,
-            sound,
-            // The first frame: a stream whose first picture is not a keyframe is a stream nobody can
-            // start watching.
-            keyframe: std::sync::atomic::AtomicBool::new(true),
-        });
+        let this = Output::alloc().set_ivars(Ivars { beat, trouble, sound });
         // SAFETY: `NSObject`'s `init` on freshly allocated storage whose ivars are set.
         unsafe { msg_send![super(this), init] }
     }

@@ -70,9 +70,10 @@ const PLAYBACK_RING: usize = VOICE_SAMPLE_RATE as usize * 2;
 
 /// Where screen-share packets go when somebody is watching one.
 ///
-/// A named type because the nesting is four deep and it appears in two signatures; bounded because
-/// video that has backed up is video worth dropping.
-type VideoTap = std::sync::mpsc::SyncSender<(PacketHeader, Vec<u8>)>;
+/// Fragments in, whole pictures out — the reassembly happens here, on the receive thread, rather than
+/// in the decoder. [`crate::screen::Tap`] explains why that distinction decides whether a share
+/// survives a decoder falling behind.
+type VideoTap = crate::screen::Tap;
 
 /// One person we can hear.
 struct Speaker {
@@ -323,14 +324,13 @@ impl VoiceSession {
     ///
     /// The channel is bounded and its overflow is dropped: see [`Shared::video`].
     pub fn watch(&self, ssrc: u32) -> crate::screen::Watcher {
-        // 120 packets is about two 4K keyframes' worth of fragments — enough that a decoder which
-        // stalls for a frame catches up, small enough that one which stalls for a second does not
-        // accumulate a backlog it would then play late.
-        let (tx, rx) = std::sync::mpsc::sync_channel(120);
+        let (tap, watcher) = crate::screen::Watcher::start(ssrc);
         if let Ok(mut video) = self.shared.video.lock() {
-            *video = Some(tx);
+            // Replacing whatever was there also discards its half-assembled pictures, which is right:
+            // they belong to a share nobody is watching any more.
+            *video = Some(tap);
         }
-        crate::screen::Watcher::start(rx, ssrc)
+        watcher
     }
 
     /// Stop feeding any decoder.
@@ -772,9 +772,9 @@ fn run_rx(shared: &Shared, transport: &Transport, own_ssrc: u32) -> Result<()> {
             // Screen media arrives on the same socket. Handed to whichever decoder is watching, and
             // dropped when there is none — or when its queue is full, which is the right answer for
             // video: a decoder that has fallen behind wants the newest picture, not a backlog.
-            if let Ok(video) = shared.video.lock() {
-                if let Some(tx) = video.as_ref() {
-                    let _ = tx.try_send((header, payload));
+            if let Ok(mut video) = shared.video.lock() {
+                if let Some(tap) = video.as_mut() {
+                    tap.feed(&header, &payload);
                 }
             }
             continue;

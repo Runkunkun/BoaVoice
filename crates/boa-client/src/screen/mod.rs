@@ -39,7 +39,7 @@ pub mod recv;
 pub mod send;
 
 pub use audio::{find_loopback, DesktopAudio, Loopback};
-pub use recv::{Feed, Frame, Watcher};
+pub use recv::{Frame, Tap, Watcher};
 pub use ffmpeg::available as ffmpeg_available;
 pub use send::{sources, Share, Source};
 
