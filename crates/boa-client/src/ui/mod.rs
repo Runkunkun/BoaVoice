@@ -191,8 +191,17 @@ pub struct App {
     share: Option<crate::screen::Share>,
     /// Whose screen we are watching, and the decoder doing it.
     watcher: Option<(Id, crate::screen::Watcher)>,
+    /// A decoder for our *own* share, fed straight from the encoder.
+    ///
+    /// The relay never sends a stream back to whoever sent it, so this is the only way to see what
+    /// everybody else is seeing — and seeing it is the point: a share nobody can check is a share that
+    /// is silently showing the wrong window.
+    preview: Option<crate::screen::Watcher>,
     /// The texture the watched screen is drawn from, with the frame number it came from.
     screen_texture: Option<(egui::TextureHandle, u64)>,
+    /// Whose picture that texture holds, so switching between two screens does not show the first
+    /// one's last frame under the second one's name.
+    texture_for: Option<Id>,
     /// The sources offered while somebody is choosing what to share.
     picking: Option<Vec<crate::screen::Source>>,
     /// What they chose, kept until the server hands back a stream id for it.
@@ -248,7 +257,9 @@ impl App {
             picking: None,
             pending_source: None,
             watcher: None,
+            preview: None,
             screen_texture: None,
+            texture_for: None,
             transfers: crate::transfer::Transfers::spawn(cc.egui_ctx.clone()),
             active_transfers: Vec::new(),
             settings,
@@ -487,6 +498,7 @@ impl App {
                 // last frame with no indication that it had stopped.
                 if self.state.me.as_ref().is_some_and(|me| me.id == *user) {
                     self.share = None;
+                    self.preview = None;
                 }
                 // Free the mixer slot the share's sound was using, or it holds one for the rest of
                 // the call and the next sharer may not get one.
@@ -589,7 +601,19 @@ impl App {
         // this is the ceiling rather than a promise.
         let height = (width * 9 / 16).max(2);
 
-        match crate::screen::Share::start(transport, ssrc, &settings, &source, width, height) {
+        // Three pictures of slack. The preview is the least important consumer of the encoder's
+        // output — the people watching come first — so its queue is small and its overflow is
+        // dropped.
+        let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel(3);
+        match crate::screen::Share::start(
+            transport,
+            ssrc,
+            &settings,
+            &source,
+            width,
+            height,
+            Some(preview_tx),
+        ) {
             Ok(share) => {
                 let sound = match (share.audio_device(), &share.audio_problem) {
                     (Some(device), _) => format!(", sound from {device}"),
@@ -609,6 +633,8 @@ impl App {
                     self.notify(Notice::error(format!("no desktop sound: {problem}")));
                 }
                 self.share = Some(share);
+                self.preview = Some(crate::screen::Watcher::preview(preview_rx));
+                self.texture_for = None;
             }
             Err(err) => {
                 self.notify(Notice::error(format!("{err}")));
@@ -646,6 +672,7 @@ impl App {
             return;
         }
         self.share = None;
+        self.preview = None;
         self.net.send_msg(ClientMsg::StopScreen);
         self.notify(Notice::error(
             if cfg!(target_os = "macos") {
@@ -658,8 +685,25 @@ impl App {
     }
 
     /// Upload a newly decoded screen frame, if there is one.
+    ///
+    /// Which decoder is read depends on what is on screen: our own share has its own, fed from the
+    /// encoder rather than from the network.
     fn poll_screen(&mut self, ctx: &egui::Context) {
-        let Some((_, watcher)) = self.watcher.as_ref() else { return };
+        let View::Watching(target) = self.view else { return };
+        let mine = self.state.me.as_ref().is_some_and(|me| me.id == target);
+        let watcher = if mine {
+            self.preview.as_ref()
+        } else {
+            self.watcher.as_ref().filter(|(who, _)| *who == target).map(|(_, watcher)| watcher)
+        };
+        let Some(watcher) = watcher else { return };
+
+        // A texture holding somebody else's last frame must not appear under this person's name.
+        if self.texture_for != Some(target) {
+            self.screen_texture = None;
+            self.texture_for = Some(target);
+        }
+
         let seen = self.screen_texture.as_ref().map(|(_, generation)| *generation).unwrap_or(0);
         let Some(frame) = watcher.take_frame(seen) else { return };
 
@@ -936,6 +980,7 @@ impl App {
                 // Locally first: the devices should stop the moment the button is pressed, not when
                 // the server's acknowledgement comes back over a connection that might be slow.
                 self.share = None;
+                self.preview = None;
                 self.watcher = None;
                 self.screen_texture = None;
                 self.voice = None;
@@ -994,36 +1039,26 @@ impl App {
                     }
                 }
 
-                // What to share is a choice, not a setting. One source shares itself; several ask.
+                // What to share is a choice, and it is asked even when there is one answer. Starting
+                // silently on the only screen is friendlier by one click and worse in every other
+                // way: nobody can see *what* is about to be shared, which for a screen is the one
+                // thing worth being sure of before it goes out.
                 let found = crate::screen::sources();
-                match found.len() {
-                    0 => {
-                        self.notify(Notice::error("nothing to share was found"));
-                        return;
-                    }
-                    1 => self.pending_source = found.into_iter().next(),
-                    _ => {
-                        self.picking = Some(found);
-                        return;
-                    }
+                if found.is_empty() {
+                    self.notify(Notice::error("nothing to share was found"));
+                    return;
                 }
-                let screen = self.settings.screen;
-                // The height follows from the longest edge and the display's own shape, which the
-                // capture module knows and this does not; 16:9 is the assumption until it reports
-                // otherwise, and it is corrected in the announcement once capture starts.
-                self.net.send_msg(ClientMsg::StartScreen(boa_proto::control::ScreenRequest {
-                    width: screen.max_dimension,
-                    height: screen.max_dimension * 9 / 16,
-                    fps: screen.fps,
-                    kbps: screen.kbps,
-                    with_audio: screen.with_audio,
-                }));
+                self.picking = Some(found);
+                return;
             }
 
             Action::ShareSource(source) => {
                 self.picking = None;
                 self.pending_source = Some(source);
                 let screen = self.settings.screen;
+                // The announced size is a ceiling, not a promise: the picture keeps the source's own
+                // resolution and the far side reads the real dimensions out of the stream itself. The
+                // 16:9 height is only what the box is shaped like.
                 self.net.send_msg(ClientMsg::StartScreen(boa_proto::control::ScreenRequest {
                     width: screen.max_dimension,
                     height: screen.max_dimension * 9 / 16,
@@ -1039,6 +1074,7 @@ impl App {
                 // Locally first: ffmpeg should stop, and the platform's recording indicator go out,
                 // the moment the button is pressed.
                 self.share = None;
+                self.preview = None;
                 self.net.send_msg(ClientMsg::StopScreen);
             }
 
@@ -1260,12 +1296,14 @@ impl eframe::App for App {
                         ));
                     }
                     View::Watching(user) => {
+                        let mine = self.state.me.as_ref().is_some_and(|me| me.id == user);
                         actions.extend(watching(
                             ui,
                             &self.state,
                             user,
                             self.screen_texture.as_ref().map(|(texture, _)| texture),
                             self.watcher.as_ref().map(|(_, watcher)| watcher),
+                            mine.then_some(self.share.as_ref()).flatten(),
                         ));
                     }
                     View::Channel(channel) => {
@@ -1403,11 +1441,81 @@ fn watching(
     user: Id,
     texture: Option<&egui::TextureHandle>,
     watcher: Option<&crate::screen::Watcher>,
+    own_share: Option<&crate::screen::Share>,
 ) -> Option<Action> {
     use std::sync::atomic::Ordering;
 
     let mut action = None;
     let label = state.label(user);
+
+    // Your own share, opened from the sidebar. It can never show a picture, and the reason is a
+    // design decision rather than a fault: the relay does not send a stream back to the person who
+    // sent it — otherwise everybody would see and hear themselves. So this shows what the *sender*
+    // is doing instead, which is what somebody testing alone actually needs to know.
+    if let Some(share) = own_share {
+        let frames = share.frames.load(Ordering::Relaxed);
+        let packets = share.packets.load(Ordering::Relaxed);
+        let audio = share.audio_packets();
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Your own screen").size(14.0).color(theme::TEXT));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{frames} frames · {packets} packets{}",
+                    if audio > 0 { format!(" · {audio} of sound") } else { String::new() }
+                ))
+                .size(10.5)
+                .color(if frames == 0 { theme::WARN } else { theme::TEXT_FAINT }),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::icon_button(ui, icons::close, 26.0, "Close").clicked() {
+                    action = Some(Action::Unwatch(user));
+                }
+            });
+        });
+
+        let rect = ui.available_rect_before_wrap();
+        // The preview: decoded from what the encoder produced, so it is what the others receive rather
+        // than a second look at the desktop. A share pointed at the wrong window looks wrong *here*.
+        if let Some(texture) = texture {
+            let size = texture.size_vec2();
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let drawn = egui::Rect::from_center_size(rect.center(), size * scale);
+            ui.painter().rect_filled(rect, theme::R_PANEL, theme::mocha::CRUST);
+            ui.painter().image(texture.id(), drawn, FULL_TEXTURE, egui::Color32::WHITE);
+            return action;
+        }
+
+        glass::well(ui, rect, theme::R_PANEL);
+        let centre = rect.center();
+        let line = |offset: f32, text: String, colour: egui::Color32, size: f32| {
+            ui.painter().text(
+                egui::pos2(centre.x, centre.y + offset),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(size),
+                colour,
+            );
+        };
+        let (text, colour) = if frames == 0 {
+            ("nothing captured yet — waiting for the first frame".to_string(), theme::WARN)
+        } else {
+            ("decoding your own stream…".to_string(), theme::TEXT_FAINT)
+        };
+        line(-8.0, text, colour, 12.0);
+        line(
+            12.0,
+            "This is decoded from what is going out, not a second look at the desktop.".to_string(),
+            theme::TEXT_FAINT,
+            10.5,
+        );
+        if let Some(device) = share.audio_device() {
+            line(36.0, format!("sound from {device}"), theme::TEXT_FAINT, 10.5);
+        } else if let Some(problem) = &share.audio_problem {
+            line(36.0, format!("no sound: {problem}"), theme::TEXT_FAINT, 10.5);
+        }
+        return action;
+    }
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{label}'s screen")).size(14.0).color(theme::TEXT));
@@ -1450,16 +1558,24 @@ fn watching(
         None => {
             glass::well(ui, rect, theme::R_PANEL);
             let share = state.voice.get(&user).and_then(|state| state.screen);
+            let arrived = watcher.map(|w| w.frames.load(Ordering::Relaxed)).unwrap_or(0);
+            let stalled = watcher.is_some_and(|w| w.since.elapsed() > Duration::from_secs(6));
             let waiting = watcher.is_some_and(|w| !w.started.load(Ordering::Relaxed));
-            let text = match (share, waiting) {
-                // Said precisely, because "nothing yet" has three quite different causes and only one
-                // of them is worth waiting for.
-                (Some(share), true) => format!(
-                    "up to {}×{} at {} fps — waiting for a keyframe (up to two seconds)",
+            let text = match (share, waiting, arrived == 0 && stalled) {
+                // "Nothing yet" has three quite different causes and only one of them is worth
+                // waiting for, so each gets its own sentence — and after six seconds of nothing the
+                // honest answer is that the packets are not arriving, not that a keyframe is due.
+                (Some(_), _, true) => format!(
+                    "no video is arriving after six seconds — UDP {} is not getting through, on \
+                     their side or on yours",
+                    state.server.as_ref().map(|s| s.media_port).unwrap_or(0)
+                ),
+                (Some(share), true, false) => format!(
+                    "{}×{} at {} fps — waiting for a keyframe (up to two seconds)",
                     share.width, share.height, share.fps
                 ),
-                (Some(_), false) => "decoding…".to_string(),
-                (None, _) => format!("{label} is not sharing a screen"),
+                (Some(_), false, _) => "decoding…".to_string(),
+                (None, _, _) => format!("{label} is not sharing a screen"),
             };
             ui.painter().text(
                 rect.center(),

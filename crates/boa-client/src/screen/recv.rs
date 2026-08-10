@@ -28,6 +28,20 @@ use openh264::formats::YUVSource as _;
 /// have started is not going to be completed.
 const IN_FLIGHT: usize = 2;
 
+/// Where a decoder gets its pictures.
+///
+/// Two sources, because there are two reasons to decode H.264 here. Watching somebody else means
+/// reassembling fragments that arrived over UDP and may be missing pieces. Watching **your own**
+/// share means taking the pictures straight from the encoder, before they are cut up — nothing can be
+/// lost, and there is no relay in between: the relay never sends a stream back to whoever sent it, so
+/// a local preview is the only way to see what everybody else is seeing.
+pub enum Feed {
+    /// Fragments from the media socket, for one sender's stream id.
+    Fragments(std::sync::mpsc::Receiver<(PacketHeader, Vec<u8>)>, u32),
+    /// Whole pictures from this machine's own encoder, with their keyframe flag.
+    Pictures(std::sync::mpsc::Receiver<(bool, Vec<u8>)>),
+}
+
 /// A decoded picture, ready to become a texture.
 pub struct Frame {
     pub width: usize,
@@ -49,6 +63,10 @@ pub struct Watcher {
     /// Set once a keyframe has been decoded, so the interface can say "waiting for a keyframe"
     /// rather than showing an empty box.
     pub started: Arc<AtomicBool>,
+    /// When watching began. After a few seconds of nothing at all, "waiting for a keyframe" is the
+    /// wrong thing to say — the packets are not arriving, and that has a different cause and a
+    /// different fix.
+    pub since: std::time::Instant,
 }
 
 impl Watcher {
@@ -58,6 +76,15 @@ impl Watcher {
     /// the right behaviour, since a decoder that has fallen behind wants the newest picture and not a
     /// backlog of old ones.
     pub fn start(packets: std::sync::mpsc::Receiver<(PacketHeader, Vec<u8>)>, ssrc: u32) -> Watcher {
+        Watcher::feed(Feed::Fragments(packets, ssrc))
+    }
+
+    /// Decode this machine's own share, for a preview of what is going out.
+    pub fn preview(pictures: std::sync::mpsc::Receiver<(bool, Vec<u8>)>) -> Watcher {
+        Watcher::feed(Feed::Pictures(pictures))
+    }
+
+    fn feed(source: Feed) -> Watcher {
         let latest = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
@@ -73,8 +100,7 @@ impl Watcher {
             std::thread::Builder::new()
                 .name("boa-screen-rx".into())
                 .spawn(move || {
-                    if let Err(err) =
-                        decode_loop(packets, ssrc, &latest, &stop, &frames, &dropped, &started)
+                    if let Err(err) = decode_loop(source, &latest, &stop, &frames, &dropped, &started)
                     {
                         log::error!("screen: decoding stopped: {err:#}");
                         crate::diagnostics::note(&format!("screen: decode stopped: {err:#}"));
@@ -83,7 +109,7 @@ impl Watcher {
                 .expect("spawning a thread")
         };
 
-        Watcher { latest, stop, thread: Some(thread), frames, dropped, started }
+        Watcher { latest, stop, thread: Some(thread), frames, dropped, started, since: std::time::Instant::now() }
     }
 
     /// Take the latest picture, if there is one newer than `seen`.
@@ -111,10 +137,8 @@ impl Drop for Watcher {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_loop(
-    packets: std::sync::mpsc::Receiver<(PacketHeader, Vec<u8>)>,
-    ssrc: u32,
+    source: Feed,
     latest: &Mutex<Option<Frame>>,
     stop: &AtomicBool,
     frames: &AtomicU64,
@@ -128,17 +152,25 @@ fn decode_loop(
     while !stop.load(Ordering::Acquire) {
         // Blocking: the thread has nothing else to do, and the channel closing is how it learns the
         // share has ended.
-        let Ok((header, payload)) = packets.recv() else { return Ok(()) };
-        if header.ssrc != ssrc || !header.kind.is_video() {
-            continue;
-        }
-
-        let Some(picture) = assembler.feed(&header, &payload, dropped) else { continue };
+        let (keyframe, picture) = match &source {
+            Feed::Fragments(packets, ssrc) => {
+                let Ok((header, payload)) = packets.recv() else { return Ok(()) };
+                if header.ssrc != *ssrc || !header.kind.is_video() {
+                    continue;
+                }
+                let Some(picture) = assembler.feed(&header, &payload, dropped) else { continue };
+                (header.kind == MediaKind::VideoKey, picture)
+            }
+            Feed::Pictures(pictures) => match pictures.recv() {
+                Ok(picture) => picture,
+                Err(_) => return Ok(()),
+            },
+        };
 
         // Until a keyframe has been seen, a delta has no reference and decoding it produces the
         // familiar smear rather than a picture.
         if !started.load(Ordering::Relaxed) {
-            if header.kind != MediaKind::VideoKey {
+            if !keyframe {
                 continue;
             }
             started.store(true, Ordering::Release);

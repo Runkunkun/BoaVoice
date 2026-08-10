@@ -185,6 +185,7 @@ impl Share {
     /// what a decoder can be expected to handle (see [`super::MAX_DIMENSION`]). A machine with a fast
     /// encoder and a fast link can send 4K at 60 frames a second, and nothing in this project will
     /// ask it not to.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         transport: Transport,
         ssrc: u32,
@@ -192,6 +193,7 @@ impl Share {
         source: &Source,
         width: u32,
         height: u32,
+        preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
     ) -> Result<Share> {
         // The audio goes first, because it is the part that can be *unavailable* rather than broken:
         // finding out before the picture starts means the user is told once, at the moment they
@@ -258,7 +260,9 @@ impl Share {
             std::thread::Builder::new()
                 .name("boa-screen-tx".into())
                 .spawn(move || {
-                    if let Err(err) = pump(stdout, &transport, ssrc, &stop, &frames, &packets) {
+                    if let Err(err) =
+                        pump(stdout, &transport, ssrc, &stop, &frames, &packets, preview)
+                    {
                         log::error!("screen: {err:#}");
                         crate::diagnostics::note(&format!("screen: send stopped: {err:#}"));
                     }
@@ -440,6 +444,7 @@ fn encoder() -> &'static str {
 }
 
 /// Read ffmpeg's output and put it on the wire.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     mut stdout: std::process::ChildStdout,
     transport: &Transport,
@@ -447,6 +452,7 @@ fn pump(
     stop: &AtomicBool,
     frames: &AtomicU64,
     packets: &AtomicU64,
+    preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
 ) -> Result<()> {
     let mut reader = Annexb::default();
     let mut buffer = vec![0u8; 64 * 1024];
@@ -464,6 +470,13 @@ fn pump(
 
         for frame in reader.feed(&buffer[..read]) {
             frames.fetch_add(1, Ordering::Relaxed);
+
+            // The local preview gets the picture whole, before it is cut up. `try_send` and a small
+            // queue: if the local decoder has fallen behind, the newest picture is the one worth
+            // having and the sending must not wait for it — the people watching come first.
+            if let Some(preview) = preview.as_ref() {
+                let _ = preview.try_send((frame.keyframe, frame.data.clone()));
+            }
             let kind = if frame.keyframe { MediaKind::VideoKey } else { MediaKind::VideoDelta };
             // Milliseconds since the share started, the same for every fragment of one picture —
             // which is also how the far side knows which fragments belong together.
