@@ -199,6 +199,10 @@ pub struct Share {
     /// Why there is no sound, when there is none and there should have been. Shown to the user, since
     /// the fix is an install rather than a setting.
     pub audio_problem: Option<String>,
+    /// The bitrate the sender is currently aiming at, in kbit/s. Shared with the sending thread, whose
+    /// pacer has to follow the encoder: pacing at three times a bitrate the encoder has abandoned would
+    /// let exactly the bursts through that the pacer exists to prevent.
+    rate: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Share {
@@ -225,6 +229,7 @@ impl Share {
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
         let packets = Arc::new(AtomicU64::new(0));
+        let rate = Arc::new(std::sync::atomic::AtomicU32::new(settings.kbps));
         let wiring = Wiring {
             transport,
             ssrc,
@@ -232,6 +237,7 @@ impl Share {
             frames: frames.clone(),
             packets: packets.clone(),
             preview,
+            rate: rate.clone(),
         };
 
         // The native engine where the source is one ScreenCaptureKit knows about. Not a fallback if it
@@ -252,6 +258,7 @@ impl Share {
                 height: started.height,
                 audio: started.audio,
                 audio_problem: started.audio_problem,
+                rate,
             });
         }
 
@@ -285,6 +292,7 @@ impl Share {
             // to keep in step.
             audio: started.audio.or(audio),
             audio_problem: started.audio_problem.or(audio_problem),
+            rate,
         })
     }
 }
@@ -309,6 +317,8 @@ struct Wiring {
     frames: Arc<AtomicU64>,
     packets: Arc<AtomicU64>,
     preview: Option<std::sync::mpsc::SyncSender<(bool, Vec<u8>)>>,
+    /// The bitrate being aimed at, which the pacer re-reads between pictures.
+    rate: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Capture with ScreenCaptureKit and encode with VideoToolbox, in this process.
@@ -460,6 +470,26 @@ impl Share {
             Engine::Native(capture) => capture.trouble(),
             Engine::Ffmpeg(_) => None,
         }
+    }
+
+    /// Aim at a different bitrate, while the share runs.
+    ///
+    /// Both halves have to move together: the encoder, so it produces fewer bytes, and the pacer, so
+    /// those bytes are still spread rather than sent in a burst. Only the native engine can do the
+    /// first — ffmpeg's bitrate is fixed on its command line — but the pacer follows either way, which
+    /// is worth having on its own.
+    pub fn set_bitrate(&self, kbps: u32) {
+        self.rate.store(kbps, Ordering::Release);
+        match &self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Native(capture) => capture.set_bitrate(kbps),
+            Engine::Ffmpeg(_) => {}
+        }
+    }
+
+    /// The bitrate currently being aimed at.
+    pub fn bitrate(&self) -> u32 {
+        self.rate.load(Ordering::Acquire)
     }
 
     /// Ask for a keyframe now, so somebody who has just started watching sees a picture.
@@ -679,6 +709,14 @@ impl Pacer {
         (8_000_000_000u64 / ceiling_bits).max(1) as u32
     }
 
+    /// Follow a new bitrate, if it has changed.
+    fn aim_at(&mut self, kbps: u32) {
+        let per_byte = Pacer::per_byte(kbps);
+        if per_byte != self.per_byte {
+            self.per_byte = per_byte;
+        }
+    }
+
     /// Wait, if this datagram is ahead of schedule, then charge it to the budget.
     fn take(&mut self, bytes: usize) {
         let now = Instant::now();
@@ -714,6 +752,9 @@ impl Wire {
     }
 
     fn put(&mut self, picture: &Picture) {
+        // Re-read between pictures rather than per datagram: the rate changes at most once a second and
+        // a picture paced at two different rates would be neither.
+        self.pacer.aim_at(self.wiring.rate.load(Ordering::Acquire));
         self.wiring.frames.fetch_add(1, Ordering::Relaxed);
 
         // The local preview gets the picture whole, before it is cut up. `try_send` and a small

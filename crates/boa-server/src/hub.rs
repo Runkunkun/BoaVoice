@@ -91,15 +91,35 @@ pub struct Hub {
     pub config: Config,
     pub db: Arc<Db>,
     pub blobs: Arc<Blobs>,
+    /// What the relay has forwarded and refused. Held here so the HTTP side can publish it: three
+    /// numbers turn "the screen share is stuttering" from a guess into a measurement.
+    pub stats: Arc<crate::relay::Stats>,
+    /// When this process started, which is the denominator for those numbers.
+    pub started: std::time::Instant,
     state: Mutex<State>,
 }
 
 impl Hub {
+    /// A hub with counters of its own, for tests that do not run a relay.
+    #[cfg(test)]
     pub fn new(config: Config, db: Arc<Db>, blobs: Arc<Blobs>) -> Self {
+        Hub::with_stats(config, db, blobs, Arc::new(crate::relay::Stats::default()))
+    }
+
+    /// Sharing the relay's counters — which is how the real server builds it, so that `/api/stats` and
+    /// the relay are looking at one set of numbers rather than two.
+    pub fn with_stats(
+        config: Config,
+        db: Arc<Db>,
+        blobs: Arc<Blobs>,
+        stats: Arc<crate::relay::Stats>,
+    ) -> Self {
         Hub {
             config,
             db,
             blobs,
+            stats,
+            started: std::time::Instant::now(),
             state: Mutex::new(State {
                 conns: HashMap::new(),
                 members: HashMap::new(),
@@ -315,6 +335,18 @@ impl Hub {
         if let Some(member) = self.state().members.get_mut(&viewer) {
             member.watching.remove(&target);
         }
+    }
+
+    /// Whether `viewer` is subscribed to `target`'s screen *and* `target` is sharing one.
+    ///
+    /// The check in front of forwarding a quality report. Not paranoia about a hostile client so much
+    /// as about a stale one: a report can be in flight when a share stops, and forwarding it to
+    /// somebody who is no longer sharing would have them adjust an encoder that does not exist.
+    pub fn is_watching(&self, viewer: Id, target: Id) -> bool {
+        let state = self.state();
+        let sharing = state.members.get(&target).is_some_and(|m| m.screen.is_some());
+        let subscribed = state.members.get(&viewer).is_some_and(|m| m.watching.contains(&target));
+        sharing && subscribed
     }
 
     pub fn voice_states(&self) -> Vec<VoiceState> {

@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
 
     let media_bind = SocketAddr::new(config.bind.ip(), config.media_port);
     let control_bind = config.bind;
-    let hub = Arc::new(Hub::new(config, db.clone(), blobs.clone()));
     let stats = Arc::new(relay::Stats::default());
+    let hub = Arc::new(Hub::with_stats(config, db.clone(), blobs.clone(), stats.clone()));
 
     let listener = tokio::net::TcpListener::bind(control_bind)
         .await

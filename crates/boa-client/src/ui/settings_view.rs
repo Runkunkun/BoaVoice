@@ -170,14 +170,29 @@ pub fn show(
                 let top = ui.cursor().top();
                 ui.add_space(10.0);
 
-                // No resolution here. What to share is picked when the button is pressed — a screen or
-                // a window — and the picture keeps that source's own resolution. A pixel setting would
-                // be a second, quieter answer to a question already asked, and the wrong one whenever
-                // the two disagree.
+                // A *ceiling*, not a resolution: the picture keeps its source's shape and is scaled
+                // down to fit inside this. It was originally hidden on the grounds that the source
+                // answers the question — which is true right up until the source is a 4K screen and
+                // sharing it at 4K is not what anybody wanted. Somebody with a 4K display and a
+                // 1080p-sized intention had no way to say so.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Size").size(11.5).color(theme::TEXT_DIM));
+                    for (label, edge) in
+                        [("720p", 1_280u32), ("1080p", 1_920), ("1440p", 2_560), ("4K", 3_840)]
+                    {
+                        let chosen = settings.screen.max_dimension == edge;
+                        if widgets::pill_button(ui, label, chosen).clicked() {
+                            settings.screen.max_dimension = edge;
+                            changed = true;
+                        }
+                    }
+                });
                 ui.label(
                     egui::RichText::new(
-                        "Shared at the source's own resolution. You pick the screen or window when \
-                         you start sharing.",
+                        "A ceiling, not a crop: a screen is scaled down to fit inside it and keeps its \
+                         shape. A smaller size is the most effective thing here — half the width is a \
+                         quarter of the pixels, and it costs the people watching far more to decode \
+                         than it costs you to send.",
                     )
                     .size(10.0)
                     .color(theme::TEXT_FAINT),
@@ -241,13 +256,29 @@ pub fn show(
                 // speed. A share is *upload*, sustained, for as long as it lasts.
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} Mbit/s of video needs that much upload, continuously — and watchers decode \
-                         in software, so a 4K60 stream can cost them more than it costs you to send.",
+                        "Now: up to {}×{} at {} fps, {:.1} Mbit/s. That much upload is needed \
+                         continuously, and it is what the sender *asks* for — a share reports how it is \
+                         arriving and the bitrate comes down by itself when it is not.",
+                        settings.screen.max_dimension,
+                        (settings.screen.max_dimension * 9 / 16).max(2),
+                        settings.screen.fps,
                         settings.screen.kbps as f32 / 1000.0
                     ))
                     .size(10.0)
                     .color(theme::TEXT_FAINT),
                 );
+                if state.voice.values().any(|voice| voice.screen.is_some()) {
+                    // Said only while something is being shared, because that is the only time it is
+                    // surprising: the encoder is built for one size and cannot be resized under way.
+                    ui.label(
+                        egui::RichText::new(
+                            "The size and frame rate apply to the next share; the bitrate applies at \
+                             once.",
+                        )
+                        .size(10.0)
+                        .color(theme::WARN),
+                    );
+                }
 
                 ui.add_space(12.0);
                 glass::fill_card(ui, slot, card_rect(ui, width, top));

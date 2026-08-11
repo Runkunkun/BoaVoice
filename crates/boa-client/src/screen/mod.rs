@@ -33,13 +33,15 @@
 
 pub mod audio;
 pub mod ffmpeg;
+pub mod governor;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod recv;
 pub mod send;
 
 pub use audio::{find_loopback, DesktopAudio, Loopback};
-pub use recv::{Frame, Tap, Watcher};
+pub use governor::Governor;
+pub use recv::{Frame, Loss, Tap, Watcher};
 pub use ffmpeg::available as ffmpeg_available;
 pub use send::{sources, Share, Source};
 

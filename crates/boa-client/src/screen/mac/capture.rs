@@ -254,6 +254,13 @@ impl Capture {
         self.trouble.lock().ok().and_then(|trouble| trouble.clone())
     }
 
+    /// Change the bitrate the encoder is aiming at, while it runs.
+    pub fn set_bitrate(&self, kbps: u32) {
+        if let Ok(encoder) = self.beat.encoder.lock() {
+            encoder.set_bitrate(kbps);
+        }
+    }
+
     /// Ask for a keyframe on the next frame, so somebody who has just joined can start decoding.
     pub fn want_keyframe(&self) {
         self.beat.keyframe.store(true, Ordering::Release);

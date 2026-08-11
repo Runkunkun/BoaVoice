@@ -29,6 +29,7 @@ use crate::hub::Hub;
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/api/info", get(info))
+        .route("/api/stats", get(stats))
         .route("/api/register", post(register))
         .route("/api/login", post(login))
         .route("/api/upload", post(upload))
@@ -105,6 +106,43 @@ async fn info(State(hub): State<Arc<Hub>>) -> Result<Json<Info>, Failure> {
         max_upload_bytes: server.max_upload_bytes,
         registration_open: hub.config.registration_allowed(first_account),
     }))
+}
+
+/// What the relay has done with the media it has been sent.
+///
+/// **Why a self-hosted server should tell you this.** When a screen share stutters there are three
+/// candidates — the sender's machine, the network, or the relay — and from the outside they look
+/// identical. Two numbers settle it: if `received` and `forwarded` track each other, the relay is
+/// passing on everything it is given and the loss is on one of the two legs of the wire; if `dropped`
+/// climbs, the relay is refusing packets and the reason is in its log. Guessing between those without
+/// numbers is how an afternoon disappears.
+///
+/// Deliberately public and unauthenticated, and deliberately only counters: how many datagrams a box
+/// has forwarded says nothing about who was talking or what they said. It is the same class of
+/// information as `/api/info`, which is also public because a client has to read it before it can log
+/// in.
+#[derive(Serialize)]
+struct RelayStats {
+    /// Datagrams that arrived on the media port, including rubbish.
+    received: u64,
+    /// Datagrams sent on to somebody. Higher than `received` when several people are watching one
+    /// screen — the same datagram goes out once per subscriber.
+    forwarded: u64,
+    /// Datagrams the relay refused: not from a registered address, the wrong kind for the stream, or
+    /// nobody subscribed to them.
+    dropped: u64,
+    /// Seconds since the process started, so a rate can be worked out from two visits.
+    uptime_secs: u64,
+}
+
+async fn stats(State(hub): State<Arc<Hub>>) -> Json<RelayStats> {
+    let (received, forwarded, dropped) = hub.stats.snapshot();
+    Json(RelayStats {
+        received,
+        forwarded,
+        dropped,
+        uptime_secs: hub.started.elapsed().as_secs(),
+    })
 }
 
 // --------------------------------------------------------------------------- //

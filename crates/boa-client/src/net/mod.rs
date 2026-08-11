@@ -440,10 +440,28 @@ async fn connection(
         .with_context(|| format!("connecting to {url}"))?;
     let (mut sink, mut stream) = socket.split();
 
-    // Identify first, before anything else is allowed on the wire.
+    // **Identify with the version the server can actually speak**, not simply with ours.
+    //
+    // The server refuses anything outside the range it knows, so a client that always announced its own
+    // newest version would be turned away by every server that had not been updated yet — and in a
+    // self-hosted app the server is a container somebody updates when they get round to it, not
+    // something that ships with the client. `/api/info` is public and is read before this, so the
+    // answer is already known; announcing the lower of the two means an older server sees a client it
+    // understands, and the newer messages simply go unused.
+    let speaking = match api::server_protocol(base).await {
+        Some(theirs) => theirs.min(boa_proto::PROTOCOL_VERSION),
+        // Unknown: announce ours. A server too old to answer `/api/info` is too old to talk to.
+        None => boa_proto::PROTOCOL_VERSION,
+    };
+    if speaking != boa_proto::PROTOCOL_VERSION {
+        log::info!(
+            "net: speaking protocol {speaking} — this build knows {}, the server is older",
+            boa_proto::PROTOCOL_VERSION
+        );
+    }
     let identify = ClientMsg::Identify {
         token: token.to_string(),
-        protocol_version: boa_proto::PROTOCOL_VERSION,
+        protocol_version: speaking,
         agent: api::agent(),
     };
     sink.send(tungstenite_text(&identify)?).await.context("identifying")?;

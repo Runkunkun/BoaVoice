@@ -29,7 +29,21 @@ pub use model::*;
 
 /// The protocol revision. Bumped on any change to [`control`] or [`media`] that
 /// an older peer could not handle.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// The oldest protocol this build still speaks.
+///
+/// A *range* rather than a single number, and that is a change of policy worth stating. Refusing
+/// anything but an exact match is the right instinct for a protocol whose two halves ship together —
+/// and wrong for one where the server is a container somebody updates on a Sunday and the clients are
+/// apps on other people's machines. Version 2 only *adds* messages (a watcher's report of how a share
+/// is arriving); a version 1 client neither sends nor understands them, and everything else about the
+/// session is identical. Turning it away would mean a server update silently breaking every client
+/// until each one is updated too.
+///
+/// What must not happen is a *changed* message being read as its older shape. So this constant moves
+/// up whenever a message changes rather than being added to.
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
 /// How long the server keeps an uploaded attachment blob before deleting it.
 ///

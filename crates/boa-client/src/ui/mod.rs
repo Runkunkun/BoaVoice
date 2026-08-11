@@ -204,6 +204,13 @@ pub struct App {
     screen_texture: Option<(egui::TextureHandle, u64)>,
     /// The shared screen in a window of its own, when somebody has asked for that.
     popout: popout::PopOut,
+    /// Decides what bitrate our own share should use, from what watchers report.
+    governor: crate::screen::Governor,
+    /// When the governor last decided, and when a watcher last reported to the sender.
+    steered: std::time::Instant,
+    reported: std::time::Instant,
+    /// What was counted at the last report, so each one covers just the second since the previous.
+    reported_at: (u64, u64),
     /// Whose picture that texture holds, so switching between two screens does not show the first
     /// one's last frame under the second one's name.
     texture_for: Option<Id>,
@@ -265,6 +272,10 @@ impl App {
             preview: None,
             screen_texture: None,
             popout: popout::PopOut::default(),
+            governor: crate::screen::Governor::new(settings.screen.kbps),
+            steered: std::time::Instant::now(),
+            reported: std::time::Instant::now(),
+            reported_at: (0, 0),
             texture_for: None,
             transfers: crate::transfer::Transfers::spawn(cc.egui_ctx.clone()),
             active_transfers: Vec::new(),
@@ -493,6 +504,17 @@ impl App {
                     // Free their mixer slot, or a later speaker cannot have it.
                     session.forget(state.ssrc);
                 }
+            }
+
+            ServerMsg::ScreenReport { from, received, lost, want_keyframe } => {
+                // A watcher saying how our share is arriving. Collected here and acted on once a
+                // second in `steer_share`, because reports from several watchers have to be compared
+                // before deciding anything.
+                self.governor.report(*received, *lost, *want_keyframe);
+                log::debug!(
+                    "screen: {from} reports {received} received, {lost} lost, \
+                     keyframe wanted: {want_keyframe}"
+                );
             }
 
             ServerMsg::ScreenStart { user, share } => {
@@ -754,6 +776,72 @@ impl App {
                 let texture = ctx.load_texture("screen", image, egui::TextureOptions::LINEAR);
                 self.screen_texture = Some((texture, frame.generation));
             }
+        }
+    }
+
+    /// Tell whoever is sharing how their picture is arriving here.
+    ///
+    /// Once a second, and only about the share actually being watched. This is the message that lets a
+    /// sender find the bitrate the connection can carry — without it the sender transmits whatever it
+    /// was configured with and never learns that it is too much, which is a share that stays broken for
+    /// as long as it lasts.
+    fn report_quality(&mut self) {
+        if self.reported.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let Some((who, watcher)) = self.watcher.as_ref() else {
+            self.reported_at = (0, 0);
+            return;
+        };
+        // Only where the server knows what to do with it. A version 1 server answers an unknown
+        // message with an error, which the interface would then show once a second.
+        if !self.state.server.as_ref().is_some_and(|server| server.protocol_version >= 2) {
+            return;
+        }
+
+        let frames = watcher.frames.load(std::sync::atomic::Ordering::Relaxed);
+        let dropped = watcher.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        // Since the last report rather than in total, so a controller at the other end is reacting to
+        // the last second and not to the whole history of the call.
+        let received = frames.saturating_sub(self.reported_at.0);
+        let lost = dropped.saturating_sub(self.reported_at.1);
+        self.reported_at = (frames, dropped);
+        self.reported = std::time::Instant::now();
+
+        // Nothing decodable yet: a keyframe is the only thing that can help, whether this is somebody
+        // who has just started watching or a stream whose reference chain loss has broken.
+        let want_keyframe = !watcher.started.load(std::sync::atomic::Ordering::Relaxed);
+        if received == 0 && lost == 0 && !want_keyframe {
+            return;
+        }
+        self.net.send_msg(ClientMsg::ScreenReport {
+            user: *who,
+            received: received.min(u32::MAX as u64) as u32,
+            lost: lost.min(u32::MAX as u64) as u32,
+            want_keyframe,
+        });
+    }
+
+    /// Act on the reports our own share has received.
+    fn steer_share(&mut self) {
+        if self.steered.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.steered = std::time::Instant::now();
+        let Some(share) = self.share.as_ref() else { return };
+
+        let decision = self.governor.decide();
+        if decision.keyframe {
+            share.want_keyframe();
+        }
+        if decision.changed {
+            log::info!("screen: sending at {} kbit/s ({}% lost)", decision.kbps, self.governor.loss());
+            crate::diagnostics::note(&format!(
+                "screen: bitrate now {} kbit/s ({}% of pictures lost)",
+                decision.kbps,
+                self.governor.loss()
+            ));
+            share.set_bitrate(decision.kbps);
         }
     }
 
@@ -1203,6 +1291,14 @@ impl App {
                     session.apply(&self.settings.voice);
                 }
                 self.apply_user_volumes();
+
+                // The bitrate is the one screen setting that can be honoured immediately: the encoder
+                // takes a new rate while it runs. Size and frame rate are built into the session and
+                // wait for the next share, which the settings screen says.
+                self.governor = crate::screen::Governor::new(self.settings.screen.kbps);
+                if let Some(share) = self.share.as_ref() {
+                    share.set_bitrate(self.settings.screen.kbps);
+                }
             }
 
             Action::SendFileDirect(to) => {
@@ -1295,6 +1391,8 @@ impl eframe::App for App {
         self.poll_voice(ctx);
         self.poll_screen(ctx);
         self.check_share();
+        self.report_quality();
+        self.steer_share();
         self.feed_popout(ctx);
         self.images.collect(ctx);
         self.state.expire();
@@ -1668,6 +1766,12 @@ fn watching(
             }
             text.push_str(sound);
             ui.label(egui::RichText::new(text).size(10.5).color(colour));
+            // And *where* the loss happened, which is the only part anybody can act on: packets going
+            // missing between here and the sender is a network problem, and a queue with no room is
+            // this machine. The two look identical in a percentage.
+            if let Some(why) = watcher.why.describe() {
+                ui.label(egui::RichText::new(why).size(10.0).color(theme::TEXT_FAINT));
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::icon_button(ui, icons::close, 26.0, "Stop watching").clicked() {

@@ -144,6 +144,28 @@ impl Encoder {
         Ok(encoder)
     }
 
+    /// Change the bitrate of a running encoder.
+    ///
+    /// VideoToolbox takes this while encoding, which is what makes adapting to a connection possible at
+    /// all: the alternative would be tearing down the session and starting a new one, and a new session
+    /// means a new keyframe and a visible stall every time the estimate moves.
+    pub fn set_bitrate(&self, kbps: u32) {
+        // SAFETY: both keys take the types given, and a refusal is logged rather than fatal.
+        unsafe {
+            self.set(kVTCompressionPropertyKey_AverageBitRate, number_i32((kbps * 1000) as i32));
+            if let Some(limits) = data_rate_limits(kbps) {
+                let status = objc2_video_toolbox::VTSessionSetProperty(
+                    &self.session as &objc2_video_toolbox::VTSession,
+                    kVTCompressionPropertyKey_DataRateLimits,
+                    Some(&limits),
+                );
+                if status != 0 {
+                    log::debug!("screen: encoder declined a new data rate limit (status {status})");
+                }
+            }
+        }
+    }
+
     /// The properties that make this a *live* encoder rather than a file encoder.
     fn configure(&self, kbps: u32) -> Result<()> {
         let fps = self.fps as i32;

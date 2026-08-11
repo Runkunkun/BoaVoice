@@ -48,6 +48,15 @@ lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
 
+# Line tables instead of full debug info. Measured on this project: a debug build with
+# `debug = true` reaches **27 GB** of `target/debug`, most of it DWARF for dependencies nobody
+# steps through, and the incremental cache alone was 9.6 GB. Line tables keep what is actually
+# read from a crash — file and line for every frame of a panic backtrace — and drop the local
+# variable and type information a debugger would want. If you need to step through code, set this
+# back to `true` for as long as that takes.
+[profile.dev]
+debug = "line-tables-only"
+
 # Voice runs in debug builds too — the capture path has to keep up with a 10 ms
 # callback deadline, and unoptimised Opus plus RNNoise does not. These three are
 # the hot ones; everything else stays debuggable.

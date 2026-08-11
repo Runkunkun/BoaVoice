@@ -126,6 +126,27 @@ pub enum ClientMsg {
     UnwatchScreen {
         user: Id,
     },
+    /// How a share is arriving, sent by a watcher about once a second.
+    ///
+    /// **The one message that makes a share usable on a real connection.** Without it a sender
+    /// transmits whatever bitrate it was configured with and never learns that half of it is being
+    /// discarded — so a link that cannot carry the configured rate stays broken for as long as the
+    /// share lasts, and no amount of cleverness at the receiving end can help. With it the sender can
+    /// do what every video call does: come down until the picture arrives, then feel its way back up.
+    ///
+    /// Counted since the previous report rather than cumulatively, so a report that goes missing
+    /// costs one second of information rather than skewing the total for the rest of the call.
+    ScreenReport {
+        /// Whose share is being reported on.
+        user: Id,
+        /// Pictures that arrived whole and decoded.
+        received: u32,
+        /// Pictures that did not — a missing fragment, or no room in the decoder's queue.
+        lost: u32,
+        /// Nothing has been decodable yet. Somebody who has just started watching, or a stream whose
+        /// reference chain was broken by loss: both need a keyframe rather than more delta frames.
+        want_keyframe: bool,
+    },
 
     /// Offer a file directly to another user. The server relays the offer and
     /// stays out of the transfer — see [`FileOffer`].
@@ -224,6 +245,17 @@ pub enum ServerMsg {
     },
     ScreenStop {
         user: Id,
+    },
+    /// A watcher's report, forwarded to the person doing the sharing.
+    ///
+    /// The server does not interpret it — it checks that the reporter is watching this share and
+    /// passes it on. Deciding what to do about loss belongs to whoever owns the encoder.
+    ScreenReport {
+        /// Who is watching.
+        from: Id,
+        received: u32,
+        lost: u32,
+        want_keyframe: bool,
     },
 
     FileOffer {

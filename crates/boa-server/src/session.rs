@@ -207,16 +207,20 @@ async fn identify(hub: &Hub, stream: &mut WsStream, sink: &mut WsSink) -> Option
             return None;
         };
 
-        if protocol_version != boa_proto::PROTOCOL_VERSION {
-            // Refused rather than attempted. A version mismatch that half-works is
-            // much harder to diagnose than one that is turned away with a number in
-            // the message.
+        if !(boa_proto::MIN_PROTOCOL_VERSION..=boa_proto::PROTOCOL_VERSION)
+            .contains(&protocol_version)
+        {
+            // A *range*, not an exact match. Anything inside it is a version this build knows how to
+            // talk to; anything outside is refused rather than attempted, because a mismatch that
+            // half-works is much harder to diagnose than one that is turned away with a number in the
+            // message. See `MIN_PROTOCOL_VERSION` for why the range exists at all.
             refuse(
                 sink,
                 ServerMsg::fatal(
                     ErrorCode::VersionMismatch,
                     format!(
-                        "this server speaks protocol {}, the client speaks {protocol_version}",
+                        "this server speaks protocol {}–{}, the client speaks {protocol_version}",
+                        boa_proto::MIN_PROTOCOL_VERSION,
                         boa_proto::PROTOCOL_VERSION
                     ),
                 ),
@@ -505,6 +509,24 @@ impl Session {
             }
 
             ClientMsg::UnwatchScreen { user } => self.hub.unwatch(self.user.id, user),
+
+            ClientMsg::ScreenReport { user, received, lost, want_keyframe } => {
+                // Forwarded, not interpreted. The server has no opinion about anybody's bitrate; it
+                // knows who is watching whom, which is the one thing the two clients cannot work out
+                // for themselves. Silently ignored when the subscription is gone: a report arriving a
+                // moment after a share stopped is normal, not an error worth a reply.
+                if self.hub.is_watching(self.user.id, user) {
+                    self.hub.send_to_user(
+                        user,
+                        ServerMsg::ScreenReport {
+                            from: self.user.id,
+                            received,
+                            lost,
+                            want_keyframe,
+                        },
+                    );
+                }
+            }
 
             ClientMsg::OfferFile { to, offer } => {
                 // The server relays the offer and has nothing to do with the transfer.

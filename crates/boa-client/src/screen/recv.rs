@@ -79,6 +79,52 @@ pub struct Tap {
     /// Pictures that never arrived whole, plus those dropped because the decoder was behind. Shown in
     /// the interface: "it stopped" and "you are losing a third of the packets" want different answers.
     dropped: Arc<AtomicU64>,
+    /// The three ways a picture can be lost, kept apart because they have three different fixes.
+    /// Without this split "20% lost" is a number nobody can act on.
+    why: Arc<Loss>,
+}
+
+/// Where the missing pictures went.
+#[derive(Default)]
+pub struct Loss {
+    /// Fragments arrived, but not all of them. The wire lost something — that is the network, or a
+    /// buffer somewhere along it.
+    pub incomplete: AtomicU64,
+    /// The picture arrived whole and there was no room for it. That is *this* machine being too slow,
+    /// and no amount of bandwidth will help.
+    pub no_room: AtomicU64,
+    /// Fragments that arrived at all, so loss can be given as a share of what was sent rather than as a
+    /// bare count.
+    pub fragments: AtomicU64,
+    /// How many of the lost pictures were keyframes. The most important number of the three: a lost
+    /// delta costs one frame, a lost keyframe costs everything until the next one.
+    pub keyframes_lost: AtomicU64,
+}
+
+impl Loss {
+    /// A sentence for the interface, or `None` when nothing is wrong.
+    ///
+    /// Names the cause rather than the symptom, because the two have nothing to do with each other:
+    /// packets going missing is somebody else's buffer, and no room in the queue is this laptop.
+    pub fn describe(&self) -> Option<String> {
+        let incomplete = self.incomplete.load(Ordering::Relaxed);
+        let no_room = self.no_room.load(Ordering::Relaxed);
+        let keyframes = self.keyframes_lost.load(Ordering::Relaxed);
+        if incomplete == 0 && no_room == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if incomplete > 0 {
+            parts.push(format!("{incomplete} incomplete on the wire"));
+        }
+        if no_room > 0 {
+            parts.push(format!("{no_room} with nowhere to go (this machine)"));
+        }
+        if keyframes > 0 {
+            parts.push(format!("{keyframes} of them keyframes"));
+        }
+        Some(parts.join(" · "))
+    }
 }
 
 impl Tap {
@@ -89,12 +135,18 @@ impl Tap {
     fn pair(
         ssrc: u32,
         depth: usize,
-    ) -> (Tap, std::sync::mpsc::Receiver<Picture>, Arc<AtomicU64>) {
+    ) -> (Tap, std::sync::mpsc::Receiver<Picture>, Arc<AtomicU64>, Arc<Loss>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(depth);
         let dropped = Arc::new(AtomicU64::new(0));
-        let tap =
-            Tap { pictures: tx, assembler: Reassembler::default(), ssrc, dropped: dropped.clone() };
-        (tap, rx, dropped)
+        let why = Arc::new(Loss::default());
+        let tap = Tap {
+            pictures: tx,
+            assembler: Reassembler::default(),
+            ssrc,
+            dropped: dropped.clone(),
+            why: why.clone(),
+        };
+        (tap, rx, dropped, why)
     }
 
     /// Take one media packet. Complete pictures go to the decoder; the rest is bookkeeping.
@@ -102,12 +154,27 @@ impl Tap {
         if header.ssrc != self.ssrc || !header.kind.is_video() {
             return;
         }
-        let Some(picture) = self.assembler.feed(header, payload, &self.dropped) else { return };
+        self.why.fragments.fetch_add(1, Ordering::Relaxed);
         let keyframe = header.kind == MediaKind::VideoKey;
+        let before = self.dropped.load(Ordering::Relaxed);
+        let picture = self.assembler.feed(header, payload, &self.dropped);
+        // The assembler counts what it gave up on; this is where the *reason* is recorded.
+        let abandoned = self.dropped.load(Ordering::Relaxed) - before;
+        if abandoned > 0 {
+            self.why.incomplete.fetch_add(abandoned, Ordering::Relaxed);
+            if keyframe {
+                self.why.keyframes_lost.fetch_add(abandoned, Ordering::Relaxed);
+            }
+        }
+        let Some(picture) = picture else { return };
         // `try_send`, because this is the network thread: blocking here would stall voice as well, and
         // a picture the decoder has no room for is a picture already out of date.
         if self.pictures.try_send((keyframe, picture)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.why.no_room.fetch_add(1, Ordering::Relaxed);
+            if keyframe {
+                self.why.keyframes_lost.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -135,6 +202,8 @@ pub struct Watcher {
     /// fragment stitched into the wrong place, a parameter set missing. One is weather, the other is a
     /// bug, and counting them together hides the bug.
     pub failed: Arc<AtomicU64>,
+    /// Which of the three kinds of loss has been happening.
+    pub why: Arc<Loss>,
     /// Set once a keyframe has been decoded, so the interface can say "waiting for a keyframe"
     /// rather than showing an empty box.
     pub started: Arc<AtomicBool>,
@@ -151,8 +220,9 @@ impl Watcher {
     /// that never arrived, or a picture the decoder had no room for — and to somebody watching a frozen
     /// picture they mean the same thing.
     pub fn start(ssrc: u32) -> (Tap, Watcher) {
-        let (tap, pictures, dropped) = Tap::pair(ssrc, QUEUE);
-        let watcher = Watcher::feed(Feed(pictures), dropped);
+        let (tap, pictures, dropped, why) = Tap::pair(ssrc, QUEUE);
+        let mut watcher = Watcher::feed(Feed(pictures), dropped);
+        watcher.why = why;
         (tap, watcher)
     }
 
@@ -193,6 +263,7 @@ impl Watcher {
             frames,
             dropped,
             failed,
+            why: Arc::new(Loss::default()),
             started,
             since: std::time::Instant::now(),
         }
@@ -381,7 +452,7 @@ mod tests {
         // 200 fragments — nearly twice what the old fragment queue could hold, and a realistic size for
         // a keyframe of a busy 1080p screen.
         let picture: Vec<u8> = (0..200 * MAX_VIDEO_CHUNK as u32).map(|i| i as u8).collect();
-        let (mut tap, pictures, dropped) = Tap::pair(7, QUEUE);
+        let (mut tap, pictures, dropped, _why) = Tap::pair(7, QUEUE);
 
         let payloads = packets(&picture);
         assert!(payloads.len() > QUEUE * 10, "the test needs a picture much larger than the queue");
@@ -400,7 +471,7 @@ mod tests {
     /// including the keyframes a stream needs to recover.
     #[test]
     fn an_overflowing_queue_loses_whole_pictures_not_pieces_of_them() {
-        let (mut tap, pictures, dropped) = Tap::pair(7, QUEUE);
+        let (mut tap, pictures, dropped, _why) = Tap::pair(7, QUEUE);
 
         // Nothing drains the queue, so everything past its depth has to go somewhere.
         let sent = QUEUE + 5;

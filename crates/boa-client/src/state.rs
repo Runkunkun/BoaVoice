@@ -313,10 +313,12 @@ impl State {
             }
 
             // Handled by the interface, not stored: the voice credentials go to the audio
-            // engine, an attachment record goes to whatever asked for it, errors go to the
-            // status area, and a pong is only interesting for its round trip.
+            // engine, an attachment record goes to whatever asked for it, a quality report goes to
+            // the thing that owns the encoder, errors go to the status area, and a pong is only
+            // interesting for its round trip.
             ServerMsg::VoiceReady { .. }
             | ServerMsg::AttachmentReady(_)
+            | ServerMsg::ScreenReport { .. }
             | ServerMsg::Error { .. }
             | ServerMsg::Pong { .. } => {}
         }

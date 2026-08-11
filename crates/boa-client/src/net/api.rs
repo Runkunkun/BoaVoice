@@ -76,6 +76,24 @@ async fn failure(response: reqwest::Response) -> anyhow::Error {
     }
 }
 
+/// The protocol version a server announces, or `None` if it cannot be asked.
+///
+/// Used at connection time to announce the *lower* of the two versions, so an older server is spoken to
+/// in a dialect it knows. Failures are not worth propagating: the connection is about to be attempted
+/// anyway and will produce a better message than this could.
+pub async fn server_protocol(base: &str) -> Option<u16> {
+    #[derive(Deserialize)]
+    struct Version {
+        protocol_version: u16,
+    }
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().ok()?;
+    let response = client.get(format!("{base}/api/info")).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<Version>().await.ok().map(|version| version.protocol_version)
+}
+
 pub async fn probe(client: &reqwest::Client, base: &str) -> Result<ServerProbe> {
     let response = client
         .get(format!("{base}/api/info"))
@@ -87,14 +105,27 @@ pub async fn probe(client: &reqwest::Client, base: &str) -> Result<ServerProbe> 
     }
     let probe: ServerProbe = response.json().await.context("reading the server's reply")?;
 
-    if probe.protocol_version != boa_proto::PROTOCOL_VERSION {
-        // Refused here rather than at the WebSocket, where the same mismatch appears as a
-        // connection that closes immediately for no visible reason.
+    // A *range*, not an exact match. Refusing anything but our own newest version would mean this
+    // client could not talk to a server that has simply not been updated yet — and in a self-hosted app
+    // that is the normal state of affairs, not an error. Anything below the floor is still refused here
+    // rather than at the WebSocket, where the same mismatch appears as a connection that closes
+    // immediately for no visible reason.
+    if probe.protocol_version < boa_proto::MIN_PROTOCOL_VERSION
+        || probe.protocol_version > boa_proto::PROTOCOL_VERSION
+    {
         bail!(
-            "{} speaks protocol {} and this client speaks {} — one of the two needs updating",
+            "{} speaks protocol {} and this client speaks {}–{} — one of the two needs updating",
             probe.name,
             probe.protocol_version,
+            boa_proto::MIN_PROTOCOL_VERSION,
             boa_proto::PROTOCOL_VERSION
+        );
+    }
+    if probe.protocol_version < boa_proto::PROTOCOL_VERSION {
+        log::info!(
+            "net: {} speaks protocol {} — the newer messages will go unused",
+            probe.name,
+            probe.protocol_version
         );
     }
     Ok(probe)
