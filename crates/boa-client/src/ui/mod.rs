@@ -934,12 +934,17 @@ impl App {
         }
 
         let frames = watcher.frames.load(std::sync::atomic::Ordering::Relaxed);
-        let dropped = watcher.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        // **Only the loss the network caused.** Pictures dropped because this machine had no room for
+        // them are loss too, and they are shown in the interface — but they are not something the
+        // *sender* should react to. Sending fewer bits does not make a slow decoder faster (the frame
+        // rate is unchanged), so folding them in would have a fast connection throttled by a busy
+        // laptop, and the picture would get worse for everybody watching.
+        let incomplete = watcher.why.incomplete.load(std::sync::atomic::Ordering::Relaxed);
         // Since the last report rather than in total, so a controller at the other end is reacting to
         // the last second and not to the whole history of the call.
         let received = frames.saturating_sub(self.reported_at.0);
-        let lost = dropped.saturating_sub(self.reported_at.1);
-        self.reported_at = (frames, dropped);
+        let lost = incomplete.saturating_sub(self.reported_at.1);
+        self.reported_at = (frames, incomplete);
         self.reported = std::time::Instant::now();
 
         // Nothing decodable yet: a keyframe is the only thing that can help, whether this is somebody
