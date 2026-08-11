@@ -689,6 +689,37 @@ mod tests {
         assert!(matches!(hub.route(&voice_on_video, addr(1001)), Route::Drop));
     }
 
+    /// The rule in front of forwarding a quality report: only a real subscriber of a real share.
+    ///
+    /// It guards two things that both happen in normal use rather than under attack — a report arriving
+    /// just after a share stopped, and somebody reporting on a share they are not watching. Acting on
+    /// either would have a sender adjusting an encoder on someone else's evidence.
+    #[test]
+    fn only_a_watcher_of_a_live_share_can_report_on_it() {
+        let hub = hub();
+        two_in_a_call(&hub, Id(10));
+
+        // Nobody is sharing yet, so there is nothing to report on.
+        assert!(!hub.is_watching(Id(2), Id(1)));
+
+        hub.start_screen(
+            Id(1),
+            ScreenRequest { width: 1920, height: 1080, fps: 30, kbps: 4_000, with_audio: false },
+        )
+        .unwrap();
+        // Sharing, but the second person has not subscribed.
+        assert!(!hub.is_watching(Id(2), Id(1)));
+
+        assert!(hub.watch(Id(2), Id(1)));
+        assert!(hub.is_watching(Id(2), Id(1)), "a subscriber of a live share may report");
+        // And not the other way round: the sharer is not watching anybody.
+        assert!(!hub.is_watching(Id(1), Id(2)));
+
+        // A report in flight when the share stops must not be acted on.
+        hub.stop_screen(Id(1));
+        assert!(!hub.is_watching(Id(2), Id(1)));
+    }
+
     #[test]
     fn screen_media_goes_only_to_subscribers() {
         let hub = hub();

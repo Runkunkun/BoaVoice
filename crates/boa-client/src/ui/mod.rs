@@ -631,6 +631,10 @@ impl App {
             }
         };
         let settings = self.settings.screen;
+        // A fresh controller per share. The previous one may have crept down to a fraction of the
+        // ceiling on a bad connection, and starting there would punish a share that has nothing to do
+        // with it — the link may well be different, and the only way to find out is to try.
+        self.governor = crate::screen::Governor::new(settings.kbps);
         let width = settings.max_dimension.min(crate::screen::MAX_DIMENSION);
         // The box the picture is fitted into. The real size comes out of the encoder — ffmpeg keeps
         // the display's aspect inside this box — and the watcher reads it from the stream itself, so
