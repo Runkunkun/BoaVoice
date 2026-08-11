@@ -204,6 +204,23 @@ pub struct App {
     screen_texture: Option<(egui::TextureHandle, u64)>,
     /// The shared screen in a window of its own, when somebody has asked for that.
     popout: popout::PopOut,
+    /// The voice channel this client believes it belongs in, kept across reconnections.
+    ///
+    /// **Not derivable from the server's state, which is exactly the point.** A reconnection — a server
+    /// restart, a network blip, a laptop lid — leaves the client holding a live audio session whose
+    /// stream id the server has never heard of. Media keeps going out and the relay drops every packet
+    /// of it, so voice and screen are both dead while the interface still shows a call in progress. This
+    /// is what lets it be rejoined instead.
+    in_call: Option<Id>,
+    /// When the current audio session was built, so a call is given a moment to establish itself
+    /// before being judged.
+    voice_since: Option<std::time::Instant>,
+    /// Since when no media has been arriving, while in a call.
+    media_bad_since: Option<std::time::Instant>,
+    /// The last automatic rejoin, and how many there have been. Two is the point at which the honest
+    /// message stops being "reconnecting" and starts naming the UDP port.
+    last_rejoin: Option<std::time::Instant>,
+    rejoins: u32,
     /// Decides what bitrate our own share should use, from what watchers report.
     governor: crate::screen::Governor,
     /// When the governor last decided, and when a watcher last reported to the sender.
@@ -272,6 +289,11 @@ impl App {
             preview: None,
             screen_texture: None,
             popout: popout::PopOut::default(),
+            in_call: None,
+            voice_since: None,
+            media_bad_since: None,
+            last_rejoin: None,
+            rejoins: 0,
             governor: crate::screen::Governor::new(settings.screen.kbps),
             steered: std::time::Instant::now(),
             reported: std::time::Instant::now(),
@@ -463,6 +485,19 @@ impl App {
                 if let Some(open) = open {
                     self.view = View::Channel(open);
                 }
+
+                // **Rejoin the call, if this was a reconnection into one.** `Ready` means a session that
+                // knows nothing about the last one: the stream ids are gone, the channel key is a new
+                // one, and the old audio session is now transmitting into a relay that discards
+                // everything it sends. Rebuilding it is the only way back, and it cannot be done
+                // silently — a share cannot survive a new stream id, so it is stopped and said so.
+                if let Some(channel) = self.in_call {
+                    if channels.iter().any(|c| c.id == channel && c.kind == ChannelKind::Voice) {
+                        self.rejoin_voice(channel, "the connection dropped");
+                    } else {
+                        self.in_call = None;
+                    }
+                }
             }
 
             ServerMsg::Error { message, fatal, .. } => {
@@ -496,7 +531,10 @@ impl App {
                 if mine {
                     // Dropping the session stops the devices, which is also what turns off the
                     // system's microphone indicator — leaving that on after a call is alarming.
+                    // And this was the server's decision, so there is nothing to rejoin.
+                    self.in_call = None;
                     self.voice = None;
+                    self.voice_since = None;
                     self.meter = Meter::default();
                 } else if let (Some(session), Some(state)) =
                     (self.voice.as_ref(), self.state.voice.get(user))
@@ -601,6 +639,11 @@ impl App {
             Ok(session) => {
                 self.voice = Some(session);
                 self.announced_speaking = false;
+                self.voice_since = Some(std::time::Instant::now());
+                self.media_bad_since = None;
+                // Whatever the interface asked for is where this belongs: joining sets it, and a
+                // session arriving unasked (the server moved us) is still a call to stay in.
+                self.in_call = Some(channel);
                 // The volumes this person has already chosen apply to the new session.
                 self.apply_user_volumes();
             }
@@ -609,6 +652,7 @@ impl App {
                 self.notify(Notice::error(format!("voice: {err}")));
                 // The call is left as far as the server is concerned: appearing in the roster of a
                 // call you cannot hear or speak in is worse than not being in it.
+                self.in_call = None;
                 self.net.send_msg(ClientMsg::LeaveVoice);
             }
         }
@@ -781,6 +825,92 @@ impl App {
                 self.screen_texture = Some((texture, frame.generation));
             }
         }
+    }
+
+    /// Build the call again from nothing.
+    ///
+    /// Everything about a voice session belongs to the server: the stream ids and the channel's key are
+    /// allocated when it is joined, and after a reconnection or a server restart none of them mean
+    /// anything. The audio session is therefore thrown away rather than reused — it would otherwise keep
+    /// transmitting into a relay that discards every packet, which is the state this whole mechanism
+    /// exists to get out of. A screen share cannot follow, because its stream id changes too.
+    fn rejoin_voice(&mut self, channel: Id, why: &str) {
+        let interrupted = self.share.is_some();
+        self.voice = None;
+        self.voice_since = None;
+        self.share = None;
+        self.preview = None;
+        self.watcher = None;
+        self.screen_texture = None;
+        self.meter = Meter::default();
+        self.media_bad_since = None;
+        self.last_rejoin = Some(std::time::Instant::now());
+        self.rejoins += 1;
+
+        self.net.send_msg(ClientMsg::JoinVoice { channel });
+        // The server starts everybody unmuted, so a rejoin has to say what was chosen before it.
+        self.net.send_msg(ClientMsg::UpdateVoiceState {
+            muted: self.settings.voice.muted,
+            deafened: self.settings.voice.deafened,
+        });
+        crate::diagnostics::note(&format!("voice: rejoining channel {channel} ({why})"));
+
+        // After the second attempt the honest answer changes. One rejoin is a hiccup; a third means the
+        // media port is not getting through at all, and no amount of rejoining will change that.
+        let media_port = self.state.server.as_ref().map(|s| s.media_port).unwrap_or(8788);
+        if self.rejoins >= 3 {
+            self.notify(Notice::error(format!(
+                "still no voice after {} attempts — UDP {media_port} is not getting through, \
+                 on this side or on the server's",
+                self.rejoins
+            )));
+        } else if interrupted {
+            self.notify(Notice::info(format!("{why} — back in the call, but your share stopped")));
+        } else {
+            self.notify(Notice::info(format!("{why} — back in the call")));
+        }
+    }
+
+    /// Notice a call whose media has stopped arriving, and rebuild it.
+    ///
+    /// **The failure this catches is invisible from the inside.** A relay forgets a stream when the
+    /// session that owns it goes — a server restart, most obviously, and every update is a restart. The
+    /// client carries on sending voice and screen to a relay that drops every packet, and the only
+    /// symptom is silence: the interface still shows a call, the control connection is fine, chat works.
+    /// The session already knows, because its own keepalives stop coming back; until now that knowledge
+    /// only became a line of red text that somebody had to notice and act on.
+    fn heal_voice(&mut self) {
+        let Some(channel) = self.in_call else { return };
+        // Nothing to be done while the control connection itself is down — and the reconnection will
+        // rejoin anyway, from `Ready`.
+        if !matches!(self.status, Status::Connected) {
+            return;
+        }
+        // A session needs a moment to start flowing before its silence means anything.
+        let Some(since) = self.voice_since else { return };
+        if since.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        if self.meter.media_ok {
+            self.media_bad_since = None;
+            // A call that has been healthy for a while has earned a clean slate, so a bad afternoon does
+            // not leave the message stuck at "three attempts".
+            if since.elapsed() > Duration::from_secs(120) {
+                self.rejoins = 0;
+            }
+            return;
+        }
+        let bad_for = self.media_bad_since.get_or_insert_with(std::time::Instant::now).elapsed();
+        // Eight seconds on top of the five the session waits before reporting the path dead: long
+        // enough that a hiccup is not treated as a broken call, short enough to be well inside anybody's
+        // patience.
+        if bad_for < Duration::from_secs(8) {
+            return;
+        }
+        if self.last_rejoin.is_some_and(|at| at.elapsed() < Duration::from_secs(20)) {
+            return;
+        }
+        self.rejoin_voice(channel, "no voice was arriving");
     }
 
     /// Tell whoever is sharing how their picture is arriving here.
@@ -1137,6 +1267,7 @@ impl App {
             Action::JoinVoice(channel) => {
                 self.view = View::Channel(channel);
                 self.ensure_history(channel);
+                self.in_call = Some(channel);
                 self.net.send_msg(ClientMsg::JoinVoice { channel });
                 // The server starts everybody unmuted; whoever was muted before joining meant it.
                 self.net.send_msg(ClientMsg::UpdateVoiceState {
@@ -1146,6 +1277,8 @@ impl App {
             }
 
             Action::LeaveVoice => {
+                // Deliberate, so there is nothing to rejoin.
+                self.in_call = None;
                 // Locally first: the devices should stop the moment the button is pressed, not when
                 // the server's acknowledgement comes back over a connection that might be slow.
                 self.share = None;
@@ -1395,6 +1528,7 @@ impl eframe::App for App {
         self.poll_voice(ctx);
         self.poll_screen(ctx);
         self.check_share();
+        self.heal_voice();
         self.report_quality();
         self.steer_share();
         self.feed_popout(ctx);
