@@ -6,7 +6,7 @@ members = ["crates/boa-proto", "crates/boa-server", "crates/boa-client"]
 # and the server share the wire types, serde and tokio; a mismatch between them is
 # a protocol bug that would only show up at runtime.
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"

@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "boa-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "boa-proto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "boa-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "argon2",
