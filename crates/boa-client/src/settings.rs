@@ -131,7 +131,7 @@ pub struct ScreenSettings {
 
 impl Default for ScreenSettings {
     fn default() -> Self {
-        // 1080p, 30 frames a second, 6 Mbit/s — and every one of those is a *default* rather than a
+        // 1080p, 30 frames a second, 4 Mbit/s — and every one of those is a *default* rather than a
         // limit: the settings screen and this file go to 8K, 240 fps and 200 Mbit/s, and nothing on the
         // server has an opinion about any of it.
         //
@@ -141,7 +141,12 @@ impl Default for ScreenSettings {
         // to a megabyte each, and a megabyte arriving in one frame interval is a burst most home links
         // simply discard. Somebody on a LAN who wants 4K60 can have it in two clicks; somebody who never
         // opens the settings gets a share that works.
-        ScreenSettings { max_dimension: 1_920, fps: 30, kbps: 6_000, with_audio: true }
+        //
+        // 4 Mbit/s rather than 6 for a measured reason: a share is *upload*, and the connection this was
+        // developed on — sold as gigabit — uploads at 40 Mbit/s. 4 Mbit/s is a tenth of that, which
+        // leaves room for the voice it accompanies, for the second person also sharing, and for whatever
+        // else the household is doing. The rate climbs by itself when the reports say there is room.
+        ScreenSettings { max_dimension: 1_920, fps: 30, kbps: 4_000, with_audio: true }
     }
 }
 

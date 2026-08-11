@@ -699,13 +699,23 @@ impl Pacer {
         Pacer { next: Instant::now(), per_byte: Pacer::per_byte(kbps) }
     }
 
-    /// Nanoseconds per byte: three times the configured bitrate, with a floor.
+    /// Nanoseconds per byte: half again the target bitrate, with a floor.
     ///
-    /// Three times, because a keyframe legitimately *is* several times an average frame and holding it
-    /// to the average would delay it by frames rather than milliseconds. The floor keeps a deliberately
-    /// tiny share from pacing itself into treacle.
+    /// **The multiplier is the whole design decision here, and it started out three times too high.**
+    /// The instinct is to leave plenty of headroom so a keyframe is not delayed — but a keyframe paced
+    /// at three times the bitrate is a burst at three times the bitrate, and the thing it has to fit
+    /// through is somebody's *upload*. A "gigabit" line is gigabit downwards; cable and VDSL uploads are
+    /// commonly 40 or 50 Mbit/s, and some are 10. Pacing a 16 Mbit/s share at 48 Mbit/s therefore
+    /// arrives at the edge of the uplink on every keyframe, and the router's queue decides which
+    /// fragments survive — which is the same as saying the keyframe does not.
+    ///
+    /// Half again is enough to stop a keyframe being drip-fed while staying well inside any link that
+    /// can carry the average at all. It costs a keyframe about 140 ms instead of 70 at 16 Mbit/s, and a
+    /// keyframe that arrives late and whole beats one that arrives on time in pieces.
+    ///
+    /// The floor keeps a deliberately tiny share from pacing itself into treacle.
     fn per_byte(kbps: u32) -> u32 {
-        let ceiling_bits = (kbps as u64 * 3 * 1_000).max(6_000_000);
+        let ceiling_bits = (kbps as u64 * 3 * 1_000 / 2).max(3_000_000);
         (8_000_000_000u64 / ceiling_bits).max(1) as u32
     }
 
@@ -987,17 +997,22 @@ mod tests {
         // Long enough to stop being a burst: without pacing those datagrams leave in under a
         // millisecond, which is gigabits per second instantaneously and more than any queue on the path
         // will hold.
-        assert!(spread.as_millis() >= 30, "not spread at all: {spread:?}");
-        // Short enough not to be noticed: a keyframe held back by a quarter of a second would be a
-        // visible stall every two seconds, which is a worse fault than the one being fixed.
-        assert!(spread.as_millis() <= 250, "held back too long: {spread:?}");
+        assert!(spread.as_millis() >= 100, "not spread enough: {spread:?}");
+        // Short enough not to be noticed as a stall: a keyframe held back by half a second would be a
+        // visible freeze every two seconds, which is a worse fault than the one being fixed.
+        assert!(spread.as_millis() <= 400, "held back too long: {spread:?}");
+
+        // And the rate it works out to must sit *below* a typical home upload rather than at it, since
+        // that is the buffer the burst has to fit through.
+        let mbit = keyframe_bytes as f64 * 8.0 / spread.as_secs_f64() / 1e6;
+        assert!(mbit < 30.0, "still bursting at {mbit:.0} Mbit/s, which is most uplinks' ceiling");
 
         // A smaller share is paced more slowly per byte — that is the whole point — but only down to the
         // floor. At the minimum bitrate the ceiling is 6 Mbit/s, so even there a 30 KB keyframe leaves
         // within about 40 ms rather than being drip-fed for half a second.
         assert!(Pacer::per_byte(200) > Pacer::per_byte(16_000), "a small share should pace more slowly");
         let small_keyframe = std::time::Duration::from_nanos(Pacer::per_byte(200) as u64 * 30_000);
-        assert!(small_keyframe.as_millis() <= 60, "the floor is too low: {small_keyframe:?}");
+        assert!(small_keyframe.as_millis() <= 120, "the floor is too low: {small_keyframe:?}");
         // And a very large one is never paced below one nanosecond per byte, which would be a division
         // by zero waiting to happen.
         assert!(Pacer::per_byte(200_000) >= 1);
@@ -1016,8 +1031,8 @@ mod tests {
         for _ in 0..40 {
             pacer.take(1_200);
         }
-        // 48 KB at the floor of 6 Mbit/s is about 64 ms. Allowing anything from a third of that upwards
-        // keeps the test about the *absence of banked credit* rather than about sleep precision.
+        // 48 KB at the floor is over a hundred milliseconds. Allowing anything from a fifth of that
+        // upwards keeps the test about the *absence of banked credit* rather than about sleep precision.
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(20),
             "the burst went straight through: {:?}",
